@@ -1,0 +1,979 @@
+#!/usr/bin/env luajit
+-- LuaJIT port of gestures <https://github.com/natask/gestures>
+-- Performance is much better than in Python.
+-- Reads /dev/input/event*, classifies gestures, dispatches configured commands.
+
+local ffi = require("ffi")
+local bit = require("bit")
+
+-- ================== FFI DECLS ==================
+ffi.cdef[[
+typedef long ssize_t;
+typedef unsigned long size_t;
+typedef int pid_t;
+typedef long time_t;
+
+struct timeval { time_t tv_sec; time_t tv_usec; };
+struct input_event {
+  struct timeval time;
+  unsigned short type;
+  unsigned short code;
+  unsigned int value;
+};
+
+struct pollfd {
+  int fd;
+  short events;
+  short revents;
+};
+
+int open(const char *pathname, int flags, ...);
+int close(int fd);
+ssize_t read(int fd, void *buf, size_t count);
+int ioctl(int fd, unsigned long request, ...);
+int poll(struct pollfd *fds, unsigned long nfds, int timeout);
+unsigned int sleep(unsigned int seconds);
+int usleep(unsigned int usec);
+
+pid_t fork(void);
+int execvp(const char *file, char *const argv[]);
+pid_t waitpid(pid_t pid, int *status, int options);
+
+char *strerror(int errnum);
+]]
+
+-- ================== CONSTANTS ==================
+-- Linux input constants
+local EV_SYN = 0x00
+local EV_ABS = 0x03
+-- SYN codes
+local SYN_REPORT     = 0x00
+local SYN_MT_REPORT  = 0x02
+
+local ABS_MT_SLOT        = 0x2f
+local ABS_MT_POSITION_X  = 0x35
+local ABS_MT_POSITION_Y  = 0x36
+local ABS_MT_TRACKING_ID = 0x39
+-- Single-touch fallbacks
+local ABS_X = 0x00
+local ABS_Y = 0x01
+
+-- Poll flags
+local POLLIN = 0x001
+
+-- Open flags
+local O_RDONLY   = 0
+local O_NONBLOCK = 0x800
+
+-- Gesture thresholds (match Python defaults)
+local DECISION = 90
+local PINCH_DECISION = 160
+
+local ANGLE_X = 20
+local ANGLE_Y = 20
+
+local DEBOUNCE = 0.02
+local THRESHOLD_SQUARED = 10
+local PINCH_THRESHOLD = 100
+
+local REP_THRES = 0.2
+local REP_DAG_DEF = 250
+local REP_DEF = 150
+local PINCH_REP_DEF = 40
+
+local DEADZONE_SQUARED = 1000
+
+local TOUCHPAD_CALIBRATION = 1
+local TOUCHSCREEN_CALIBRATION = 2
+
+-- Debug controls
+local DEBUG = false
+local STOP = false
+local TYPE_FILTER = {} -- e.g. {"angle","slot","gesture"}
+local RUNNING = true
+
+-- ================== UTIL ==================
+local function dprint(tag, ...)
+  if not DEBUG then return end
+  local args = {...}
+  for i=1,#args do
+    if type(args[i]) ~= "string" then args[i] = tostring(args[i]) end
+  end
+  if (#TYPE_FILTER == 0) then
+    io.stderr:write(tag .. ": " .. table.concat(args, " ") .. "\n")
+  else
+    for _,t in ipairs(TYPE_FILTER) do
+      if t == tag then
+        io.stderr:write(tag .. ": " .. table.concat(args, " ") .. "\n")
+        break
+      end
+    end
+  end
+end
+
+-- Raw event debug (tag = "raw")
+local function dprint_raw(evtype, code, val)
+  dprint("raw", string.format("type=0x%02x code=0x%02x val=%d", evtype, code, val))
+end
+
+local function count_keys(t)
+  local n = 0; for _ in pairs(t) do n = n + 1 end; return n
+end
+
+local function split_args(cmd)
+  -- simple shlex-like splitter (handles double quoted spaces)
+  local args, i, len = {}, 1, #cmd
+  while i <= len do
+    while i <= len and cmd:sub(i,i):match("%s") do i = i + 1 end
+    if i > len then break end
+    local ch = cmd:sub(i,i)
+    if ch == '"' then
+      local j = i + 1
+      while j <= len and cmd:sub(j,j) ~= '"' do
+        if cmd:sub(j,j) == '\\' and j < len then j = j + 1 end
+        j = j + 1
+      end
+      table.insert(args, cmd:sub(i+1, j-1))
+      i = j + 1
+    else
+      local j = i
+      while j <= len and not cmd:sub(j,j):match("%s") do j = j + 1 end
+      table.insert(args, cmd:sub(i, j-1))
+      i = j
+    end
+  end
+  return args
+end
+
+local function ev_time_seconds(ev)
+  return tonumber(ev.time.tv_sec) + tonumber(ev.time.tv_usec) / 1e6
+end
+
+-- ================== CONFIG =================-
+local function boolish(v, default)
+  if type(v) == "boolean" then return v end
+  if type(v) == "string" then
+    if v == "True" or v == "true" then return true end
+    if v == "False" or v == "false" then return false end
+  end
+  return default
+end
+
+-- Native config parsing of relaxed gesture config syntax:
+-- * single quotes for strings
+-- * # comments to end-of-line (ignored when inside quotes)
+-- * optional trailing commas before } or ]
+-- * stringified booleans 'True'/'False'
+-- We transform to strict JSON then decode with inlined json decoder.
+local function read_file_all(path)
+  local f = io.open(path, 'r'); if not f then return nil, 'cannot open '..path end
+  local d = f:read('*a'); f:close(); return d
+end
+
+-- Direct relaxed-config parser producing Lua tables (no JSON intermediary)
+local function parse_relaxed_config(src)
+  local i, len = 1, #src
+  local function peek() return src:sub(i,i) end
+  local function nextc() local c = src:sub(i,i); i = i + 1; return c end
+  local function skip_ws_and_comments()
+    while i <= len do
+      local c = peek()
+      if c == '' then return end
+      if c == '#' then
+        while i <= len and peek() ~= '\n' do i = i + 1 end
+      elseif c:match('%s') then
+        i = i + 1
+      else
+        break
+      end
+    end
+  end
+  local function parse_string()
+    local quote = nextc() -- ' or "
+    local buf = {}
+    while i <= len do
+      local c = nextc()
+      if c == '' then error("unterminated string") end
+      if c == '\\' then
+        local esc = nextc()
+        if esc == 'n' then buf[#buf+1] = '\n'
+        elseif esc == 'r' then buf[#buf+1] = '\r'
+        elseif esc == 't' then buf[#buf+1] = '\t'
+        elseif esc == '"' then buf[#buf+1] = '"'
+        elseif esc == "'" then buf[#buf+1] = "'"
+        elseif esc == '\\' then buf[#buf+1] = '\\'
+        else buf[#buf+1] = esc end
+      elseif c == quote then
+        return table.concat(buf)
+      else
+        buf[#buf+1] = c
+      end
+    end
+    error("unterminated string")
+  end
+  local function parse_number()
+    local start = i
+    while i <= len and src:sub(i,i):match('[%d%.eE+-]') do i = i + 1 end
+    local numstr = src:sub(start, i-1)
+    local n = tonumber(numstr)
+    if n == nil then error("invalid number: "..numstr) end
+    return n
+  end
+  local function parse_literal()
+    if src:sub(i,i+3) == 'true' then i = i + 4; return true end
+    if src:sub(i,i+4) == 'false' then i = i + 5; return false end
+    if src:sub(i,i+3) == 'null' then i = i + 4; return nil end
+    -- Allow capitalized string booleans; treat as raw strings so boolish() can handle later
+    if src:sub(i,i+3) == 'True' then i = i + 4; return 'True' end
+    if src:sub(i,i+4) == 'False' then i = i + 5; return 'False' end
+    error('unexpected literal at '..i)
+  end
+  local parse_value
+  local function parse_array()
+    local arr = {}
+    nextc() -- consume [
+    skip_ws_and_comments()
+    if peek() == ']' then nextc(); return arr end
+    local idx = 1
+    while true do
+      arr[idx] = parse_value(); idx = idx + 1
+      skip_ws_and_comments()
+      local c = peek()
+      if c == ']' then nextc(); break end
+      if c == ',' then
+        nextc(); skip_ws_and_comments()
+        -- allow trailing comma before ]
+        if peek() == ']' then nextc(); break end
+      else
+        error('expected , or ] at '..i)
+      end
+    end
+    return arr
+  end
+  local function parse_object()
+    local obj = {}
+    nextc() -- consume {
+    skip_ws_and_comments()
+    if peek() == '}' then nextc(); return obj end
+    while true do
+      local c = peek()
+      if c ~= '"' and c ~= "'" then error('expected string key at '..i) end
+      local key = parse_string()
+      skip_ws_and_comments()
+      if nextc() ~= ':' then error('expected : after key at '..i) end
+      skip_ws_and_comments()
+      obj[key] = parse_value()
+      skip_ws_and_comments()
+      local d = peek()
+      if d == '}' then nextc(); break end
+      if d == ',' then
+        nextc(); skip_ws_and_comments()
+        -- allow trailing comma
+        if peek() == '}' then nextc(); break end
+      else
+        error('expected , or } at '..i)
+      end
+    end
+    return obj
+  end
+  parse_value = function()
+    skip_ws_and_comments()
+    local c = peek()
+    if c == '"' or c == "'" then return parse_string()
+    elseif c == '{' then return parse_object()
+    elseif c == '[' then return parse_array()
+    elseif c == '-' or c:match('%d') then return parse_number()
+    elseif c:match('[A-Za-z]') then return parse_literal()
+    else
+      error('unexpected char '..c..' at '..i)
+    end
+  end
+  local result = parse_value()
+  skip_ws_and_comments()
+  return result
+end
+
+local function native_load_config()
+  local cfg_path = os.getenv('GESTURES_CONFIG') or ((os.getenv('HOME') or '')..'/.config/gestures.conf')
+  local raw, err = read_file_all(cfg_path)
+  if not raw then return nil, err end
+  local ok, decoded = pcall(parse_relaxed_config, raw)
+  if not ok then return nil, 'parse error: '..tostring(decoded) end
+  return decoded
+end
+
+local function get_config_table()
+  -- Try native first
+  local tbl, err = native_load_config()
+  if tbl then
+    dprint('gesture', 'Config loaded natively.')
+    return tbl
+  end
+  dprint('gesture', 'Native parse failed:', err or 'unknown')
+  return {}
+end
+
+local function load_config_for_device(device_key)
+  local all = get_config_table()
+  if type(all) ~= 'table' then
+    dprint('gesture','Config structure invalid, using built-in defaults')
+    return {
+      pinch_deadzone_enabled = false,
+      swipe = { ["3"] = { l = { start = {"xdotool key alt+Left"} }, r = { start = {"xdotool key alt+Right"} } } },
+      pinch = { ["2"] = { i = { start = {"echo pinch-in"} }, o = { start = {"echo pinch-out"} } } }
+    }, false
+  end
+  local global_dead = boolish(all["pinch_deadzone_enabled"], false)
+  local dev = all[device_key] or {}
+  local dev_dead = boolish(dev["pinch_deadzone_enabled"], global_dead)
+  dev["pinch_deadzone_enabled"] = dev_dead
+  return dev, dev_dead
+end
+
+-- ================== GESTURE STATE ==================
+local function newGestureState(pinched_deadzone_enabled)
+  return {
+    type = nil,                                -- table: {type, fingers, direction, event, update_direction}
+    slots = {},                                -- slot -> { x-cum, y-cum, moved }
+    total = { ["x-cum"]=0, ["y-cum"]=0, ["dis-cum"]=0, moved=0 },
+    pinch = true,                              -- still eligible to become pinch
+    gesture_queue = {},                        -- list of argv arrays
+    rep_start = 0,
+    debounce = 0,
+    last_command_is_gesture_end = false,
+    pinch_deadzone_enabled = pinched_deadzone_enabled,
+    started = false,
+    max_fingers = 0
+  }
+end
+
+local function max_distance(status)
+  local keys = {}
+  for k,_ in pairs(status) do keys[#keys+1] = k end
+  local n = #keys
+  if n < 2 then return 0 end
+  local maxd = 0
+  for i=1,n do
+    local a = status[keys[i]]
+    for j=i+1,n do
+      local b = status[keys[j]]
+      local dx = a.x - b.x
+      local dy = a.y - b.y
+      local d = math.sqrt(dx*dx + dy*dy)
+      if d > maxd then maxd = d end
+    end
+  end
+  return maxd
+end
+
+local function out_of_deadzone(gs)
+  local all_out = true
+  for slot, sl in pairs(gs.slots) do
+    local mv = sl["x-cum"]*sl["x-cum"] + sl["y-cum"]*sl["y-cum"]
+    dprint("slot", "slot", slot, "mv", tostring(mv))
+    all_out = all_out and (mv > DEADZONE_SQUARED)
+  end
+  return all_out
+end
+
+-- ================== COMMAND QUEUE ==================
+local function enqueue(gs, dev_conf, evsec)
+  local g = gs.type
+  if not g then return end
+  local ok, target = pcall(function()
+    if g.direction == "t" then
+      return dev_conf[g.type][g.fingers][g.direction]
+    elseif g.event == "update" then
+      return dev_conf[g.type][g.fingers][g.direction][g.event][g.update_direction]
+    else
+      return dev_conf[g.type][g.fingers][g.direction][g.event]
+    end
+  end)
+  if not ok or not target then
+    dprint("gesture", "Gesture recognized but not configured.")
+    return
+  end
+  for _,cmd in ipairs(target) do
+    if type(cmd) == 'string' then
+      local trimmed = cmd:match('^%s*(.-)%s*$')
+      if trimmed ~= '' then
+        local argv = split_args(trimmed)
+        if #argv > 0 and argv[1] ~= '' then
+          gs.gesture_queue[#gs.gesture_queue+1] = argv
+        end
+      end
+    end
+  end
+  if evsec then gs.debounce = evsec end
+end
+
+local function exec_queue(gs, async)
+  if #gs.gesture_queue == 0 then return end
+  for _,argv in ipairs(gs.gesture_queue) do
+    if not STOP then
+      local pid = ffi.C.fork()
+      if pid == 0 then
+        -- child: build argv vector with stable buffers
+        local cargv = ffi.new("char *[?]", #argv+1)
+        local bufs = {}
+        for i,a in ipairs(argv) do
+          local buf = ffi.new("char[?]", #a+1)
+          ffi.copy(buf, a)
+          bufs[i] = buf
+          cargv[i-1] = buf
+        end
+        cargv[#argv] = nil
+        ffi.C.execvp(argv[1], cargv)
+        os.exit(1)
+      else
+        if not async then
+          ffi.C.waitpid(pid, nil, 0)
+        end
+      end
+    end
+  end
+  gs.gesture_queue = {}
+end
+
+local function getRep(gs, dev_conf, default)
+  local g = gs.type
+  local ok, rep = pcall(function() return dev_conf[g.type][g.fingers][g.direction]["rep"] end)
+  if ok then
+    if type(rep) == "number" then return rep end
+  end
+  return default
+end
+
+-- ================== CLASSIFICATION ==================
+local function classify_after_move(gs, status, dev_conf, evsec)
+  local slots = gs.slots
+  local total = gs.total
+  local no_slots = count_keys(slots)
+
+  -- Moved?
+  -- pinch start
+  if (not gs.type) and gs.pinch and total.moved >= 1 and no_slots == 2 then
+    local x_cum = math.abs(total["x-cum"])
+    local y_cum = math.abs(total["y-cum"])
+    local dis_cum = total["dis-cum"]
+    dprint("gesture", string.format("dis_cum=%d x_cum+y_cum=%d", dis_cum, x_cum + y_cum))
+    if x_cum + y_cum > PINCH_DECISION then
+      gs.pinch = false
+    end
+    if math.abs(dis_cum) > PINCH_THRESHOLD and ((not gs.pinch_deadzone_enabled) or out_of_deadzone(gs)) then
+  gs.type = { type="pinch", fingers=tostring(no_slots), event="start", direction = (dis_cum > 0 and 'i' or 'o') }
+  enqueue(gs, dev_conf, evsec)
+      gs.rep_start = evsec
+      -- reset cumulators after triggering start
+      total["x-cum"], total["y-cum"], total["dis-cum"] = 0,0,0
+      return
+    end
+  end
+
+  -- swipe start
+  if (not gs.type) and no_slots >= 3 and total.moved == no_slots then
+    local x_cum = math.abs(total["x-cum"])
+    local y_cum = math.abs(total["y-cum"])
+    if (x_cum*x_cum + y_cum*y_cum) > ((no_slots * DECISION) ^ 2) then
+      dprint("angle", string.format("x_cum=%d y_cum=%d", x_cum, y_cum))
+      local dir
+      local tanX = math.tan(ANGLE_X * math.pi/180)
+      local tanY = math.tan((90-ANGLE_Y) * math.pi/180)
+      if y_cum <= x_cum * tanX then
+        dir = (total["x-cum"] <= 0) and "l" or "r"
+      elseif y_cum >= x_cum * tanY then
+        dir = (total["y-cum"] <= 0) and "u" or "d"
+      else
+        local x = total["x-cum"]; local y = total["y-cum"]
+        if x*y > 0 then
+          dir = (x <=0 and y <0) and "lu" or "rd"
+        else
+          dir = (x >=0 and y <0) and "ru" or "ld"
+        end
+      end
+      gs.type = { type="swipe", fingers=tostring(no_slots), event="start", direction=dir }
+  enqueue(gs, dev_conf, evsec)
+      gs.rep_start = evsec
+      gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"] = 0,0,0
+    end
+  end
+
+  -- updates (repeat)
+  if gs.type then
+    if (evsec - gs.rep_start) < REP_THRES then
+      total["x-cum"], total["y-cum"], total["dis-cum"] = 0,0,0
+      return
+    end
+    gs.type.event = "update"
+    if gs.type.type == "pinch" then
+      local rep = getRep(gs, dev_conf, PINCH_REP_DEF)
+      if math.abs(total["dis-cum"]) > rep then
+  gs.type.update_direction = (total["dis-cum"] > 0) and 'i' or 'o'
+  enqueue(gs, dev_conf, evsec)
+        total["dis-cum"] = 0
+      end
+    else
+      -- swipe
+      local dir = gs.type.direction
+      if dir == 'l' or dir == 'r' or dir == 'u' or dir == 'd' then
+        local rep = getRep(gs, dev_conf, REP_DEF)
+        if total["x-cum"] >= rep then
+          gs.type.update_direction = 'r'; enqueue(gs, dev_conf, evsec); total["x-cum"] = 0
+        elseif total["x-cum"] <= -rep then
+          gs.type.update_direction = 'l'; enqueue(gs, dev_conf, evsec); total["x-cum"] = 0
+        elseif total["y-cum"] >= rep then
+          gs.type.update_direction = 'd'; enqueue(gs, dev_conf, evsec); total["y-cum"] = 0
+        elseif total["y-cum"] <= -rep then
+          gs.type.update_direction = 'u'; enqueue(gs, dev_conf, evsec); total["y-cum"] = 0
+        end
+      else
+        -- diagonals: lu, rd, ld, ru
+        local rep = getRep(gs, dev_conf, REP_DAG_DEF)
+        if (total["x-cum"] + total["y-cum"]) >= rep then
+          gs.type.update_direction = 'rd'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
+        elseif (total["x-cum"] + total["y-cum"]) <= -rep then
+          gs.type.update_direction = 'lu'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
+        elseif (total["x-cum"] - total["y-cum"]) >= rep then
+          gs.type.update_direction = 'ru'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
+        elseif (total["x-cum"] - total["y-cum"]) <= -rep then
+          gs.type.update_direction = 'ld'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
+        end
+      end
+    end
+  end
+end
+
+-- ================== DEVICE LOOP ==================
+local function create_device(devpath, calibration, device_key)
+  local dev_conf, pinch_deadzone_enabled = load_config_for_device(device_key)
+  local fd = ffi.C.open(devpath, bit.bor(O_RDONLY, O_NONBLOCK))
+  if fd < 0 then
+    io.stderr:write("Failed to open "..devpath.."\n")
+    return nil
+  end
+
+  -- Orientation (safe)
+  local orientation = ""
+  do
+    local p = io.popen("orientation 2>/dev/null")
+    if p then
+      local line = p:read("*l")
+      p:close()
+      orientation = tostring(line or ""):gsub("%s+$","")
+    else
+      orientation = ""
+    end
+  end
+  local orientation_y = ((orientation == "inverted") or (orientation == "right")) and -1 or 1
+  local orientation_x = ((orientation == "inverted") or (orientation == "left")) and -1 or 1
+  local swap_x_y = (orientation == "right") or (orientation == "left")
+  dprint("gesture", "orientation:", orientation, "swap:", tostring(swap_x_y), "ox:", tostring(orientation_x), "oy:", tostring(orientation_y))
+
+  local ev_size = ffi.sizeof("struct input_event")
+  local ev = ffi.new("struct input_event")
+  local status = {}  -- slot -> {x,y,x_updated,y_updated,first}
+  local current_slot = 0
+  local gs = newGestureState(pinch_deadzone_enabled)
+  gs.debounce = 0
+  local has_mt_slot = false -- detect if device emits ABS_MT_SLOT; else fallback to synthetic slot 0
+  local typeA = { mode=false, current_tid=nil, tid_to_slot={}, slot_to_tid={}, next_slot=0 }
+
+  local function ensure_slot_exists(slot)
+    local new_created = false
+    if not status[slot] then
+      status[slot] = { x=0, y=0, last_x=0, last_y=0, x_updated=false, y_updated=false, first=true }
+      new_created = true
+    end
+    if not gs.slots[slot] then
+      gs.slots[slot] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 }
+    end
+    if new_created then
+      if (gs.max_fingers or 0) < (count_keys(status)) then
+        gs.max_fingers = count_keys(status)
+      end
+    end
+  end
+
+  local function finger_start(evsec, slot)
+    -- Match Python semantics: every new finger start resets accumulators, preserving existing slot keys
+    gs.last_command_is_gesture_end = false
+    gs.debounce = evsec
+    gs.type = nil
+    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0,0,0,0
+    local prev_slots = gs.slots
+    gs.slots = {}
+    for k,_ in pairs(prev_slots) do
+      gs.slots[k] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 }
+    end
+    if not gs.slots[slot] then
+      gs.slots[slot] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 }
+    end
+    -- Initialize last processed coordinates to current sample
+    local s = status[slot]
+    if s then s.last_x, s.last_y = s.x, s.y end
+  end
+
+  local function process_update(slot, nx, ny, evsec)
+    -- prepare slot entry
+    if not gs.slots[slot] then gs.slots[slot] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 } end
+    local prev = status[slot]
+    local dx = nx - (prev.last_x or prev.x)
+    local dy = ny - (prev.last_y or prev.y)
+    local sl = gs.slots[slot]
+    sl["x-cum"] = sl["x-cum"] + dx
+    sl["y-cum"] = sl["y-cum"] + dy
+    gs.total["x-cum"] = gs.total["x-cum"] + dx
+    gs.total["y-cum"] = gs.total["y-cum"] + dy
+
+    local before = max_distance(status)
+    prev.x = nx; prev.y = ny
+    prev.last_x = nx; prev.last_y = ny
+    local after = max_distance(status)
+    gs.total["dis-cum"] = gs.total["dis-cum"] + (after - before)
+
+    if sl.moved == 0 then
+      if (sl["x-cum"]*sl["x-cum"] + sl["y-cum"]*sl["y-cum"]) > THRESHOLD_SQUARED then
+        sl.moved = 1
+        gs.total.moved = gs.total.moved + 1
+      end
+    end
+    dprint("gesture", string.format("total x=%d y=%d dis=%d moved=%d", gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved))
+    classify_after_move(gs, status, dev_conf, evsec)
+  end
+
+  local function gesture_end(evsec)
+    local no_slots = count_keys(gs.slots)
+    dprint("gesture", "gesture_end slots="..tostring(no_slots))
+    if (evsec - gs.debounce) >= DEBOUNCE then
+      if gs.type then
+        gs.type.event = "end"
+        enqueue(gs, dev_conf, evsec)
+      else
+        -- Tap fallback based on max fingers during gesture session
+        local fingers = gs.max_fingers or no_slots
+        if fingers >= 3 then
+          gs.type = { type="swipe", fingers=tostring(fingers), direction="t" }
+          enqueue(gs, dev_conf, evsec)
+        end
+      end
+    end
+    -- Exec queue now; async if 5 fingers
+    local fingers_async = gs.max_fingers or no_slots
+    exec_queue(gs, fingers_async == 5)
+
+    -- reset params
+    gs.gesture_queue = {}
+    gs.pinch = true
+    gs.debounce = evsec
+    gs.started = false
+    gs.max_fingers = 0
+    local old_slots = gs.slots
+    gs.type = nil
+    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0,0,0,0
+    gs.slots = {}
+    for k,_ in pairs(old_slots) do gs.slots[k] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 } end
+  end
+
+  local function flush_if_debounced(nowsec)
+    if (#gs.gesture_queue ~= 0) and ((nowsec - gs.debounce) >= DEBOUNCE) then
+      exec_queue(gs, false)
+    end
+  end
+
+  local function allocate_slot()
+    -- Find the lowest free non-negative slot index
+    local used = {}
+    -- consider both current gesture slots and status slots to avoid collisions
+    for s,_ in pairs(gs.slots) do used[s] = true end
+    for s,_ in pairs(status) do used[s] = true end
+    local i = 0
+    while used[i] do i = i + 1 end
+    return i
+  end
+
+  local function ensure_typeA_slot_for_tid(tid)
+    local slot = typeA.tid_to_slot[tid]
+    if slot == nil then
+      slot = allocate_slot()
+      typeA.tid_to_slot[tid] = slot
+      typeA.slot_to_tid[slot] = tid
+    end
+    return slot
+  end
+
+  local function end_typeA_tid(tid, evsec)
+    local slot = typeA.tid_to_slot[tid]
+    if slot ~= nil then
+      -- finalize any pending first/update before removal
+      local s = status[slot]
+      if s and (s.x_updated or s.y_updated) then
+        if s.first then s.first = false; finger_start(evsec, slot) else process_update(slot, s.x, s.y, evsec) end
+      end
+      status[slot] = nil
+      gs.slots[slot] = nil
+      typeA.slot_to_tid[slot] = nil
+      typeA.tid_to_slot[tid] = nil
+    end
+  end
+
+  local function finalize_slot(slot, evsec)
+    local s = status[slot]
+    if not s then return end
+    if s.first then
+      s.first = false
+      finger_start(evsec, slot)
+    else
+      process_update(slot, s.x, s.y, evsec)
+    end
+    s.x_updated, s.y_updated = false, false
+  end
+
+  local dev = {
+    fd = fd,
+    kind = device_key,
+    calibration = calibration,
+    read_available = function()
+      while true do
+        local r = ffi.C.read(fd, ev, ev_size)
+        if r ~= ev_size then break end
+
+        local evsec = ev_time_seconds(ev)
+
+        if ev.type == EV_SYN then
+          if ev.code == SYN_MT_REPORT then
+            -- Type A devices: per-contact separator
+            if typeA.mode and typeA.current_tid ~= nil then
+              local slot = typeA.tid_to_slot[typeA.current_tid]
+              if slot ~= nil then
+                -- finalize pending updates for this contact even if only one axis changed
+                local s = status[slot]
+                if s and (s.x_updated or s.y_updated) then
+                  finalize_slot(slot, evsec)
+                end
+              end
+              -- clear current finger context
+              typeA.current_tid = nil
+            end
+          elseif ev.code == SYN_REPORT then
+            -- End of frame: finalize any pending partial updates
+            for slot,_ in pairs(status) do
+              local s = status[slot]
+              if s and (s.x_updated or s.y_updated) then
+                finalize_slot(slot, evsec)
+              end
+            end
+            flush_if_debounced(evsec)
+          else
+            -- Other SYN codes: still consider flushing debounced queue
+            flush_if_debounced(evsec)
+          end
+        elseif ev.type == EV_ABS then
+          local code = ev.code
+          local val = ev.value
+          dprint_raw(ev.type, code, val)
+          if code == ABS_MT_SLOT then
+            current_slot = val
+            ensure_slot_exists(current_slot)
+            has_mt_slot = true
+          elseif code == ABS_MT_TRACKING_ID then
+            local is_minus_one = (val == 0xFFFFFFFF) or (bit.tobit(val) == -1)
+            if is_minus_one then
+              -- finger removed
+              if not gs.last_command_is_gesture_end then
+                gs.last_command_is_gesture_end = true
+                gesture_end(evsec)
+              end
+              if has_mt_slot then
+                status[current_slot] = nil
+                gs.slots[current_slot] = nil
+              else
+                typeA.mode = true
+                if typeA.current_tid ~= nil then
+                  end_typeA_tid(typeA.current_tid, evsec)
+                  typeA.current_tid = nil
+                end
+              end
+            else
+              if has_mt_slot then
+                ensure_slot_exists(current_slot)
+                status[current_slot].first = true
+                status[current_slot].x_updated = false
+                status[current_slot].y_updated = false
+              else
+                typeA.mode = true
+                typeA.current_tid = val
+                local slot = ensure_typeA_slot_for_tid(val)
+                current_slot = slot
+                ensure_slot_exists(current_slot)
+                status[current_slot].first = true
+                status[current_slot].x_updated = false
+                status[current_slot].y_updated = false
+              end
+            end
+          elseif code == ABS_MT_POSITION_X then
+            if not has_mt_slot then
+              typeA.mode = true
+              if typeA.current_tid ~= nil then
+                current_slot = ensure_typeA_slot_for_tid(typeA.current_tid)
+              else
+                -- if no current TID yet, use synthetic slot 0 for now
+                current_slot = 0
+              end
+            end
+            if not status[current_slot] then ensure_slot_exists(current_slot) end
+            local s = status[current_slot]
+            if swap_x_y then
+              s.y = (val / calibration) * orientation_y
+              s.y_updated = true
+            else
+              s.x = (val / calibration) * orientation_x
+              s.x_updated = true
+            end
+          elseif code == ABS_MT_POSITION_Y then
+            if not has_mt_slot then
+              typeA.mode = true
+              if typeA.current_tid ~= nil then
+                current_slot = ensure_typeA_slot_for_tid(typeA.current_tid)
+              else
+                current_slot = 0
+              end
+            end
+            if not status[current_slot] then ensure_slot_exists(current_slot) end
+            local s = status[current_slot]
+            if swap_x_y then
+              s.x = (val / calibration) * orientation_x
+              s.x_updated = true
+            else
+              s.y = (val / calibration) * orientation_y
+              s.y_updated = true
+            end
+          elseif code == ABS_X or code == ABS_Y then
+            -- Single-touch fallback mapped to slot 0, only if device lacks MT slots
+            if not has_mt_slot then
+              current_slot = 0
+              ensure_slot_exists(current_slot)
+              local s = status[current_slot]
+              if code == ABS_X then
+                if swap_x_y then
+                  s.y = (val / calibration) * orientation_y; s.y_updated = true
+                else
+                  s.x = (val / calibration) * orientation_x; s.x_updated = true
+                end
+              else -- ABS_Y
+                if swap_x_y then
+                  s.x = (val / calibration) * orientation_x; s.x_updated = true
+                else
+                  s.y = (val / calibration) * orientation_y; s.y_updated = true
+                end
+              end
+            end
+          end
+
+          local s = status[current_slot]
+          if s and s.x_updated and s.y_updated then
+            if s.first then
+              s.first = false
+              finger_start(evsec, current_slot)
+            else
+              process_update(current_slot, s.x, s.y, evsec)
+            end
+            s.x_updated, s.y_updated = false, false
+          end
+        end
+      end
+    end,
+    close = function()
+      if fd >= 0 then ffi.C.close(fd) end
+    end
+  }
+
+  return dev
+end
+
+-- ================== DISCOVERY (simplified) ==================
+local function discover()
+  -- Simple discovery: touch devices with "event*" handler and "Touch" in name
+  local f = io.open("/proc/bus/input/devices","r")
+  if not f then return {} end
+  local content = f:read("*a"); f:close()
+  local devices = {}
+  for block in content:gmatch("(.-)\n\n") do
+    local handlers = block:match("Handlers=([^\n]+)")
+    local name = block:match('N: Name="([^"]+)"') or "?"
+    if handlers and handlers:find("event") and (block:find("Touch") or block:lower():find("touch")) then
+      local event = handlers:match("(event%d+)")
+      if event then
+        -- crude heuristic: treat touchpad vs touchscreen by name
+        local kind = (name:lower():find("touchscreen") or name:lower():find("ts")) and "touchscreen" or "touchpad"
+        table.insert(devices, { path="/dev/input/"..event, kind=kind })
+      end
+    end
+  end
+  return devices
+end
+
+-- ================== MAIN ==================
+local function parse_args(argv)
+  for _, a in ipairs(argv) do
+    if a == "debug" then DEBUG = true
+    elseif a == "stop" then STOP = true
+    elseif a == "angle" or a == "slot" or a == "gesture" or a == "raw" then
+      TYPE_FILTER[#TYPE_FILTER+1] = a
+    end
+  end
+end
+
+local function main(argv)
+  parse_args(argv or {})
+  local devs = discover()
+  if #devs == 0 then
+    io.stderr:write("No touch devices found.\n")
+    return
+  end
+  -- Create coroutine-driven device processors and poll all fds in one loop
+  local processors = {}
+  local pollfds = ffi.new("struct pollfd[?]", #devs)
+  for i,info in ipairs(devs) do
+    local calibration = (info.kind == "touchscreen") and TOUCHSCREEN_CALIBRATION or TOUCHPAD_CALIBRATION
+    io.stderr:write(string.format("Using %s (%s)\n", info.path, info.kind))
+    local dev = create_device(info.path, calibration, info.kind)
+    if dev then
+      -- build coroutine that reacts to 'readable' signals
+      local co = coroutine.create(function()
+        while RUNNING do
+          local sig = coroutine.yield()
+          if sig == 'readable' then dev.read_available() end
+        end
+        dev.close()
+      end)
+      processors[i] = { dev = dev, co = co }
+      pollfds[i-1].fd = dev.fd
+      pollfds[i-1].events = POLLIN
+    end
+  end
+  if #processors == 0 then
+    io.stderr:write("Failed to initialize any devices.\n")
+    return
+  end
+  -- Prime coroutines
+  for _,p in ipairs(processors) do coroutine.resume(p.co) end
+
+  while RUNNING do
+    local pret = ffi.C.poll(pollfds, #processors, -1)
+    if pret < 0 then break end
+    for i,p in ipairs(processors) do
+      if bit.band(pollfds[i-1].revents, POLLIN) ~= 0 then
+        coroutine.resume(p.co, 'readable')
+      end
+    end
+  end
+  -- shutdown
+  for _,p in ipairs(processors) do
+    coroutine.resume(p.co) -- let it close
+    p.dev.close()
+  end
+end
+
+if pcall(debug.getlocal, 4, 1) == false then
+  main(arg)
+end
