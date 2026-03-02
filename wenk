@@ -129,24 +129,52 @@ local function count_keys(t)
 end
 
 local function split_args(cmd)
-  -- simple shlex-like splitter (handles double quoted spaces)
+  -- simple shlex-like splitter (handles quoted spaces with either quote type)
+  -- returns a list of arguments without the surrounding quotes
   local args, i, len = {}, 1, #cmd
   while i <= len do
+    -- skip whitespace
     while i <= len and cmd:sub(i,i):match("%s") do i = i + 1 end
     if i > len then break end
     local ch = cmd:sub(i,i)
-    if ch == '"' then
+    if ch == '"' or ch == "'" then
+      -- quoted token
+      local quote = ch
       local j = i + 1
-      while j <= len and cmd:sub(j,j) ~= '"' do
-        if cmd:sub(j,j) == '\\' and j < len then j = j + 1 end
-        j = j + 1
+      while j <= len do
+        local c = cmd:sub(j,j)
+        if c == '\\' and j < len then
+          -- skip escaped char (including escaped quote)
+          j = j + 2
+        elseif c == quote then
+          break
+        else
+          j = j + 1
+        end
+      end
+      -- if we hit end without closing quote, log debug and take until end
+      if j > len then
+        dprint("parse", "unterminated quote in arg: %s", cmd)
+        j = len
       end
       table.insert(args, cmd:sub(i+1, j-1))
       i = j + 1
     else
+      -- unquoted token (handle simple backslash-escaped space)
+      local buf = ""
       local j = i
-      while j <= len and not cmd:sub(j,j):match("%s") do j = j + 1 end
-      table.insert(args, cmd:sub(i, j-1))
+      while j <= len and not cmd:sub(j,j):match("%s") do
+        local c = cmd:sub(j,j)
+        if c == '\\' and j < len and cmd:sub(j+1,j+1):match("%s") then
+          -- escape space or other whitespace
+          buf = buf .. cmd:sub(j+1,j+1)
+          j = j + 2
+        else
+          buf = buf .. c
+          j = j + 1
+        end
+      end
+      table.insert(args, buf)
       i = j
     end
   end
