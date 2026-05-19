@@ -373,7 +373,7 @@ local function newGestureState(pinched_deadzone_enabled)
   return {
     type = nil,                                -- table: {type, fingers, direction, event, update_direction}
     slots = {},                                -- slot -> { x-cum, y-cum, moved }
-    total = { ["x-cum"]=0, ["y-cum"]=0, ["dis-cum"]=0, moved=0 },
+    total = { ["x-cum"]=0.0, ["y-cum"]=0.0, ["dis-cum"]=0.0, moved=0 },
     pinch = true,                              -- still eligible to become pinch
     gesture_queue = {},                        -- list of argv arrays
     rep_start = 0,
@@ -547,7 +547,7 @@ local function classify_after_move(gs, status, dev_conf, evsec)
     local x_cum = math.abs(total["x-cum"])
     local y_cum = math.abs(total["y-cum"])
     local dis_cum = total["dis-cum"]
-    dprintf("gesture", "dis_cum=%d x_cum+y_cum=%d", dis_cum, x_cum + y_cum)
+    dprintf("gesture", "dis_cum=%.0f x_cum+y_cum=%.0f", dis_cum, x_cum + y_cum)
     if x_cum + y_cum > PINCH_DECISION then
       gs.pinch = false
     end
@@ -556,7 +556,7 @@ local function classify_after_move(gs, status, dev_conf, evsec)
   enqueue(gs, dev_conf, evsec)
       gs.rep_start = evsec
       -- reset cumulators after triggering start
-      total["x-cum"], total["y-cum"], total["dis-cum"] = 0,0,0
+      total["x-cum"], total["y-cum"], total["dis-cum"] = 0.0,0.0,0.0
       return
     end
   end
@@ -566,7 +566,7 @@ local function classify_after_move(gs, status, dev_conf, evsec)
     local x_cum = math.abs(total["x-cum"])
     local y_cum = math.abs(total["y-cum"])
     if (x_cum*x_cum + y_cum*y_cum) > ((no_slots * DECISION) ^ 2) then
-      dprintf("angle", "x_cum=%d y_cum=%d", x_cum, y_cum)
+      dprintf("angle", "x_cum=%.0f y_cum=%.0f", x_cum, y_cum)
       local dir
       local tanX = math.tan(ANGLE_X * math.pi/180)
       local tanY = math.tan((90-ANGLE_Y) * math.pi/180)
@@ -585,14 +585,14 @@ local function classify_after_move(gs, status, dev_conf, evsec)
       gs.type = { type="swipe", fingers=tostring(no_slots), event="start", direction=dir }
   enqueue(gs, dev_conf, evsec)
       gs.rep_start = evsec
-      gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"] = 0,0,0
+      gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"] = 0.0,0.0,0.0
     end
   end
 
   -- updates (repeat)
   if gs.type then
     if (evsec - gs.rep_start) < REP_THRES then
-      total["x-cum"], total["y-cum"], total["dis-cum"] = 0,0,0
+      total["x-cum"], total["y-cum"], total["dis-cum"] = 0.0,0.0,0.0
       return
     end
     gs.type.event = "update"
@@ -679,7 +679,7 @@ local function create_device(devpath, calibration, device_key)
       new_created = true
     end
     if not gs.slots[slot] then
-      gs.slots[slot] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 }
+      gs.slots[slot] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 }
     end
     if new_created then
       if (gs.max_fingers or 0) < (count_keys(status)) then
@@ -693,14 +693,14 @@ local function create_device(devpath, calibration, device_key)
     gs.last_command_is_gesture_end = false
     gs.debounce = evsec
     gs.type = nil
-    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0,0,0,0
+    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0.0,0.0,0.0,0
     local prev_slots = gs.slots
     gs.slots = {}
     for k,_ in pairs(prev_slots) do
-      gs.slots[k] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 }
+      gs.slots[k] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 }
     end
     if not gs.slots[slot] then
-      gs.slots[slot] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 }
+      gs.slots[slot] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 }
     end
     -- Initialize last processed coordinates to current sample
     local s = status[slot]
@@ -709,7 +709,7 @@ local function create_device(devpath, calibration, device_key)
 
   local function process_update(slot, nx, ny, evsec)
     -- prepare slot entry
-    if not gs.slots[slot] then gs.slots[slot] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 } end
+    if not gs.slots[slot] then gs.slots[slot] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 } end
     local prev = status[slot]
     local dx = nx - (prev.last_x or prev.x)
     local dy = ny - (prev.last_y or prev.y)
@@ -730,7 +730,7 @@ local function create_device(devpath, calibration, device_key)
         gs.total.moved = gs.total.moved + 1
       end
     end
-    dprintf("gesture", "total x=%d y=%d dis=%d moved=%d", gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved)
+    dprintf("gesture", "total x=%.0f y=%.0f dis=%.0f moved=%d", gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved)
     classify_after_move(gs, status, dev_conf, evsec)
   end
 
@@ -762,9 +762,9 @@ local function create_device(devpath, calibration, device_key)
     gs.max_fingers = 0
     local old_slots = gs.slots
     gs.type = nil
-    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0,0,0,0
+    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0.0,0.0,0.0,0
     gs.slots = {}
-    for k,_ in pairs(old_slots) do gs.slots[k] = { ["x-cum"]=0, ["y-cum"]=0, moved=0 } end
+    for k,_ in pairs(old_slots) do gs.slots[k] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 } end
   end
 
   local function flush_if_debounced(nowsec)
