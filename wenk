@@ -83,7 +83,6 @@ local PINCH_REP_DEF = 40
 local WNOHANG = 1
 
 local EINTR = 4
-local EAGAIN = 11
 
 local DEADZONE_SQUARED = 1000
 
@@ -1105,7 +1104,7 @@ local function main(argv)
     return true
   end
 
-  for i,info in ipairs(devs) do
+  for _i,info in ipairs(devs) do
     local calibration = (info.kind == "touchscreen") and TOUCHSCREEN_CALIBRATION or TOUCHPAD_CALIBRATION
     io.stderr:write(string.format("Using %s (%s)\n", info.path, info.kind))
     local dev = create_device(info.path, calibration, info.kind)
