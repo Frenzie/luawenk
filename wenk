@@ -82,6 +82,9 @@ local REP_DEF = 150
 local PINCH_REP_DEF = 40
 local WNOHANG = 1
 
+local EINTR = 4
+local EAGAIN = 11
+
 local DEADZONE_SQUARED = 1000
 
 local TOUCHPAD_CALIBRATION = 1
@@ -826,7 +829,18 @@ local function create_device(devpath, calibration, device_key)
     read_available = function()
       while true do
         local r = ffi.C.read(fd, ev, ev_size)
-        if r ~= ev_size then break end
+        if r == ev_size then
+          -- full event read, continue processing
+        elseif r < 0 then
+          local err = ffi.errno()
+          if err == EINTR then
+            -- interrupted syscall; retry
+          else
+            break
+          end
+        else
+          break
+        end
 
         local evsec = ev_time_seconds(ev)
 
