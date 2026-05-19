@@ -391,7 +391,7 @@ local function max_distance(status)
   for k,_ in pairs(status) do keys[#keys+1] = k end
   local n = #keys
   if n < 2 then return 0 end
-  local maxd2 = 0
+  local maxd2 = 0.0
   for i=1,n do
     local a = status[keys[i]]
     for j=i+1,n do
@@ -411,8 +411,8 @@ local function max_distance_delta(status, updated_slot, nx, ny)
   local n = #keys
   if n < 2 then return 0 end
 
-  local max_before2 = 0
-  local max_after2 = 0
+  local max_before2 = 0.0
+  local max_after2 = 0.0
   for i=1,n do
     local ka = keys[i]
     local a = status[ka]
