@@ -511,14 +511,14 @@ local function enqueue(gs, dev_conf, evsec)
   if evsec then gs.debounce = evsec end
 end
 
-local function exec_queue(gs, async)
-  local function reap_children_nonblocking()
-    while true do
-      local pid = ffi.C.waitpid(-1, nil, WNOHANG)
-      if pid <= 0 then break end
-    end
+local function reap_children_nonblocking()
+  while true do
+    local pid = ffi.C.waitpid(-1, nil, WNOHANG)
+    if pid <= 0 then break end
   end
+end
 
+local function exec_queue(gs, async)
   if async then
     reap_children_nonblocking()
   end
