@@ -369,6 +369,33 @@ local function load_config_for_device(device_key)
 end
 
 -- ================== GESTURE STATE ==================
+---@class GestureType
+---@field type string
+---@field fingers string
+---@field direction string
+---@field event string
+---@field update_direction string|nil
+
+---@class GestureSlot
+---@field ['x-cum'] number
+---@field ['y-cum'] number
+---@field moved number
+
+---@class GestureState
+---@field type? GestureType
+---@field slots table<number, GestureSlot>
+---@field total {['x-cum']: number, ['y-cum']: number, ['dis-cum']: number, moved: number}
+---@field pinch boolean
+---@field gesture_queue table
+---@field rep_start number
+---@field debounce number
+---@field last_command_is_gesture_end boolean
+---@field pinch_deadzone_enabled boolean
+---@field started boolean
+---@field max_fingers number
+
+---@param pinched_deadzone_enabled boolean
+---@return GestureState
 local function newGestureState(pinched_deadzone_enabled)
   return {
     type = nil,                                -- table: {type, fingers, direction, event, update_direction}
