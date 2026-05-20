@@ -529,15 +529,14 @@ local function exec_queue(gs, async)
       local pid = ffi.C.fork()
       if pid == 0 then
         -- child: build argv vector with stable buffers
-        local cargv = ffi.new("char *[?]", #argv+1)
-        local bufs = {}
+        local argc = #argv
+        local cargv = ffi.new("char *[?]", argc + 1)
         for i,a in ipairs(argv) do
           local buf = ffi.new("char[?]", #a+1)
           ffi.copy(buf, a)
-          bufs[i] = buf
           cargv[i-1] = buf
         end
-        cargv[#argv] = nil
+        cargv[argc] = nil
         ffi.C.execvp(argv[1], cargv)
         os.exit(1)
       else
