@@ -432,6 +432,9 @@ local function max_distance(status)
 end
 
 local function max_distance_delta(status, updated_slot, nx, ny)
+  -- Skip scan when identical.
+  local staged = status[updated_slot]
+  if staged and staged.x == nx and staged.y == ny then return 0 end
   local keys = {}
   for k,_ in pairs(status) do keys[#keys+1] = k end
   local n = #keys
