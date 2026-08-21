@@ -59,7 +59,10 @@ local ABS_X = 0x00
 local ABS_Y = 0x01
 
 -- Poll flags
-local POLLIN = 0x001
+local POLLIN   = 0x001
+local POLLERR  = 0x008
+local POLLHUP  = 0x010
+local POLLNVAL = 0x020
 
 -- Open flags
 local O_RDONLY   = 0
@@ -83,6 +86,12 @@ local PINCH_REP_DEF = 40
 local WNOHANG = 1
 
 local EINTR = 4
+local EAGAIN = 11
+
+-- Main loop tuning
+local RESCAN_MS = 1000
+local MAX_DEVICES = 16
+local OPEN_RETRY_S = 5 -- cooldown before re-attempting a failed device open
 
 local DEADZONE_SQUARED = 1000
 
@@ -850,10 +859,15 @@ local function create_device(devpath, calibration, device_key)
     s.x_updated, s.y_updated = false, false
   end
 
+  local dead = false   -- set by read_available on EOF/fatal error
+  local closed = false
+
   local dev = {
     fd = fd,
+    path = devpath,
     kind = device_key,
     calibration = calibration,
+    is_dead = function() return dead end,
     read_available = function()
       while true do
         local r = ffi.C.read(fd, ev, ev_size)
@@ -863,10 +877,14 @@ local function create_device(devpath, calibration, device_key)
           local err = ffi.errno()
           if err == EINTR then
             -- interrupted syscall; retry
+          elseif err == EAGAIN then
+            break -- drained; normal for O_NONBLOCK
           else
+            dead = true -- fatal (ENODEV etc.): signal removal
             break
           end
         else
+          dead = true -- r == 0: device gone
           break
         end
 
@@ -1016,7 +1034,10 @@ local function create_device(devpath, calibration, device_key)
       end
     end,
     close = function()
-      if fd >= 0 then ffi.C.close(fd) end
+      if not closed and fd >= 0 then
+        closed = true
+        ffi.C.close(fd)
+      end
     end
   }
 
@@ -1113,15 +1134,11 @@ local function main(argv)
     run_benchmark()
     return
   end
-  local devs = discover()
-  if #devs == 0 then
-    io.stderr:write("No touch devices found.\n")
-    return
-  end
-  -- Create coroutine-driven device processors and poll all fds in one loop
+  -- Coroutine-driven device processors polled in one loop, with hotplug
+  -- support: dead devices are dropped and discovery reruns periodically.
   local processors = {}
-  local pollfds = ffi.new("struct pollfd[?]", #devs)
   local processor_count = 0
+  local pollfds = ffi.new("struct pollfd[?]", MAX_DEVICES)
 
   local function resume_or_report(co, ...)
     local ok, err = coroutine.resume(co, ...)
@@ -1133,48 +1150,125 @@ local function main(argv)
     return true
   end
 
-  for _i,info in ipairs(devs) do
+  local function find_processor_by_path(path)
+    for i=1,processor_count do
+      if processors[i].dev.path == path then return i end
+    end
+    return nil
+  end
+
+  local open_failed = {} -- path -> os.time() of last failed open
+
+  local function add_device(info)
+    if processor_count >= MAX_DEVICES then
+      io.stderr:write("Device limit reached, ignoring "..info.path.."\n")
+      return false
+    end
+    if find_processor_by_path(info.path) then return false end
     local calibration = (info.kind == "touchscreen") and TOUCHSCREEN_CALIBRATION or TOUCHPAD_CALIBRATION
-    io.stderr:write(string.format("Using %s (%s)\n", info.path, info.kind))
     local dev = create_device(info.path, calibration, info.kind)
-    if dev then
-      -- build coroutine that reacts to 'readable' signals
-      local co = coroutine.create(function()
-        while RUNNING do
-          local sig = coroutine.yield()
-          if sig == 'readable' then dev.read_available() end
-        end
-        dev.close()
-      end)
-      processor_count = processor_count + 1
-      processors[processor_count] = { dev = dev, co = co }
-      pollfds[processor_count-1].fd = dev.fd
-      pollfds[processor_count-1].events = POLLIN
+    if not dev then
+      open_failed[info.path] = os.time()
+      return false
+    end
+    open_failed[info.path] = nil
+    -- build coroutine that reacts to 'readable'/'shutdown' signals
+    local co = coroutine.create(function()
+      while RUNNING do
+        local sig = coroutine.yield()
+        if sig == 'shutdown' then break end
+        if sig == 'readable' then dev.read_available() end
+      end
+      dev.close()
+    end)
+    processor_count = processor_count + 1
+    processors[processor_count] = { dev = dev, co = co }
+    pollfds[processor_count-1].fd = dev.fd
+    pollfds[processor_count-1].events = POLLIN
+    pollfds[processor_count-1].revents = 0
+    io.stderr:write(string.format("Using %s (%s)\n", info.path, info.kind))
+    resume_or_report(co) -- prime
+    return true
+  end
+
+  local function remove_processor(i)
+    local p = processors[i]
+    io.stderr:write("Device lost: "..p.dev.path.."\n")
+    resume_or_report(p.co, 'shutdown')
+    p.dev.close()
+    -- swap-with-last compaction; order is irrelevant for poll()
+    local last = processor_count
+    if i ~= last then
+      processors[i] = processors[last]
+      pollfds[i-1] = pollfds[last-1]
+    end
+    processors[last] = nil
+    pollfds[last-1].fd = -1
+    pollfds[last-1].revents = 0
+    processor_count = last - 1
+  end
+
+  local function rescan()
+    local seen = {}
+    local now = os.time()
+    for _,info in ipairs(discover()) do
+      local cooling = open_failed[info.path] and (now - open_failed[info.path]) < OPEN_RETRY_S
+      if not seen[info.path] and not find_processor_by_path(info.path) and not cooling then
+        seen[info.path] = true
+        add_device(info)
+      end
     end
   end
+
+  rescan()
   if processor_count == 0 then
-    io.stderr:write("Failed to initialize any devices.\n")
-    return
-  end
-  -- Prime coroutines
-  for i=1,processor_count do
-    if not resume_or_report(processors[i].co) then return end
+    io.stderr:write("No touch devices yet, waiting...\n")
   end
 
   while RUNNING do
-    local pret = ffi.C.poll(pollfds, processor_count, -1)
-    if pret < 0 then break end
-    for i=1,processor_count do
-      local p = processors[i]
-      if bit.band(pollfds[i-1].revents, POLLIN) ~= 0 then
-        if not resume_or_report(p.co, 'readable') then break end
+    local pret
+    if processor_count == 0 then
+      -- nothing to poll; idle until next rescan window
+      ffi.C.usleep(RESCAN_MS * 1000)
+      pret = 0
+    else
+      pret = ffi.C.poll(pollfds, processor_count, RESCAN_MS)
+    end
+    local need_rescan = false
+    if pret < 0 then
+      local err = ffi.errno()
+      if err == EINTR then
+        -- interrupted by signal; just loop again
+      else
+        io.stderr:write("poll failed: "..tostring(ffi.string(ffi.C.strerror(err))).."\n")
+        break
       end
+    elseif pret == 0 then
+      need_rescan = true
+    else
+      local i = 1
+      while i <= processor_count do
+        local rev = pollfds[i-1].revents
+        if bit.band(rev, bit.bor(POLLERR, POLLHUP, POLLNVAL)) ~= 0 or processors[i].dev.is_dead() then
+          remove_processor(i)
+          need_rescan = true
+          -- index stays put so a swapped-in entry gets inspected too
+        elseif bit.band(rev, POLLIN) ~= 0 then
+          if not resume_or_report(processors[i].co, 'readable') then break end
+          i = i + 1
+        else
+          i = i + 1
+        end
+      end
+    end
+    if need_rescan and RUNNING then
+      rescan()
     end
   end
   -- shutdown
   for i=1,processor_count do
     local p = processors[i]
-    resume_or_report(p.co) -- let it close
+    resume_or_report(p.co, 'shutdown')
     p.dev.close()
   end
 end
