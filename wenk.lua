@@ -40,6 +40,28 @@ int execvp(const char *file, char *const argv[]);
 pid_t waitpid(pid_t pid, int *status, int options);
 
 char *strerror(int errnum);
+]];
+
+-- Packed per-finger state (cdata arena): avoids per-event hash lookups and
+-- per-gesture-start/end table churn (resets become memset-speed ffi.fill).
+ffi.cdef[[
+typedef struct {
+  double x, y;
+  double last_x, last_y;
+  bool active;
+  bool first;
+  bool x_updated, y_updated;
+} wenk_point_t;
+
+typedef struct {
+  double xcum, ycum;
+  int32_t moved;
+} wenk_acc_t;
+
+typedef struct {
+  double xcum, ycum, discum;
+  int32_t moved;
+} wenk_total_t;
 ]]
 
 -- ================== CONSTANTS ==================
@@ -74,6 +96,8 @@ local PINCH_DECISION = 160
 
 local ANGLE_X = 20
 local ANGLE_Y = 20
+local TANX = math.tan(ANGLE_X * math.pi/180)
+local TANY = math.tan((90-ANGLE_Y) * math.pi/180)
 
 local DEBOUNCE = 0.02
 local THRESHOLD_SQUARED = 10
@@ -87,6 +111,11 @@ local WNOHANG = 1
 
 local EINTR = 4
 local EAGAIN = 11
+
+-- Upper bound for tracked MT slots. Kernel slot ids and the synthetic Type A
+-- ids stay far below this; events referencing higher slots are dropped with a
+-- one-time warning.
+local MAX_SLOTS = 64
 
 -- Main loop tuning
 local RESCAN_MS = 1000
@@ -133,10 +162,6 @@ end
 -- Raw event debug (tag = "raw")
 local function dprint_raw(evtype, code, val)
   dprintf("raw", "type=0x%02x code=0x%02x val=%d", evtype, code, val)
-end
-
-local function count_keys(t)
-  local n = 0; for _ in pairs(t) do n = n + 1 end; return n
 end
 
 local function split_args(cmd)
@@ -385,15 +410,11 @@ end
 ---@field event string
 ---@field update_direction string|nil
 
----@class GestureSlot
----@field ['x-cum'] number
----@field ['y-cum'] number
----@field moved number
-
 ---@class GestureState
 ---@field type? GestureType
----@field slots table<number, GestureSlot>
----@field total {['x-cum']: number, ['y-cum']: number, ['dis-cum']: number, moved: number}
+---@field acc ffi.cdata* -- wenk_acc_t[MAX_SLOTS]: per-slot {xcum, ycum, moved}
+---@field sactive ffi.cdata* -- bool[MAX_SLOTS]: session slot membership (survives gesture resets)
+---@field total ffi.cdata* -- wenk_total_t
 ---@field pinch boolean
 ---@field gesture_queue table
 ---@field rep_start number
@@ -402,14 +423,16 @@ end
 ---@field pinch_deadzone_enabled boolean
 ---@field started boolean
 ---@field max_fingers number
+---@field nslots number
 
 ---@param pinched_deadzone_enabled boolean
 ---@return GestureState
 local function newGestureState(pinched_deadzone_enabled)
   return {
     type = nil,                                -- table: {type, fingers, direction, event, update_direction}
-    slots = {},                                -- slot -> { x-cum, y-cum, moved }
-    total = { ["x-cum"]=0.0, ["y-cum"]=0.0, ["dis-cum"]=0.0, moved=0 },
+    acc = ffi.new("wenk_acc_t[?]", MAX_SLOTS), -- per-slot movement accumulators
+    sactive = ffi.new("bool[?]", MAX_SLOTS),   -- membership; preserved across resets like the old key set
+    total = ffi.new("wenk_total_t"),
     pinch = true,                              -- still eligible to become pinch
     gesture_queue = {},                        -- list of argv arrays
     rep_start = 0,
@@ -417,77 +440,105 @@ local function newGestureState(pinched_deadzone_enabled)
     last_command_is_gesture_end = false,
     pinch_deadzone_enabled = pinched_deadzone_enabled,
     started = false,
-    max_fingers = 0
+    max_fingers = 0,
+    nslots = 0                                 -- maintained incrementally
   }
 end
 
-local function max_distance(status)
-  local keys = {}
-  for k,_ in pairs(status) do keys[#keys+1] = k end
-  local n = #keys
-  if n < 2 then return 0 end
-  local maxd2 = 0.0
-  for i=1,n do
-    local a = status[keys[i]]
-    for j=i+1,n do
-      local b = status[keys[j]]
-      local dx = a.x - b.x
-      local dy = a.y - b.y
-      local d2 = dx*dx + dy*dy
-      if d2 > maxd2 then maxd2 = d2 end
-    end
-  end
-  return math.sqrt(maxd2)
+-- ============ Incremental max-pairwise-distance monitor ============
+-- Exact delta of sqrt(max pairwise distance) between the committed snapshot
+-- (updated slot at its last-processed coords ox,oy) and the after-snapshot
+-- (slot at nx,ny). Tracks the argmax pair so a move NOT touching that pair is
+-- O(n): only distances from the moved point can change. Falls back to an
+-- exact O(n^2) rescan when the move touches the current pair or membership
+-- changed (add/remove). Coordinates are read from last_x/last_y only.
+local function mon_new()
+  return { max2 = 0.0, pi = -1, pj = -1, valid = false }
 end
 
-local function max_distance_delta(status, updated_slot, nx, ny)
-  -- Skip scan when identical.
-  local staged = status[updated_slot]
-  if staged and staged.x == nx and staged.y == ny then return 0 end
-  local keys = {}
-  for k,_ in pairs(status) do keys[#keys+1] = k end
-  local n = #keys
-  if n < 2 then return 0 end
-
-  local max_before2 = 0.0
-  local max_after2 = 0.0
-  for i=1,n do
-    local ka = keys[i]
-    local a = status[ka]
-    local ax, ay = a.x, a.y
-    local ax2, ay2 = ax, ay
-    if ka == updated_slot then
-      ax2, ay2 = nx, ny
-    end
-    for j=i+1,n do
-      local kb = keys[j]
-      local b = status[kb]
-      local bx, by = b.x, b.y
-      local bx2, by2 = bx, by
-      if kb == updated_slot then
-        bx2, by2 = nx, ny
+local function mon_rebuild(mon, pts, n)
+  local max2, pi, pj = 0.0, -1, -1
+  local cnt = 0
+  for i=0,MAX_SLOTS-1 do
+    local a = pts[i]
+    if a.active then
+      cnt = cnt + 1
+      local ax, ay = a.last_x, a.last_y
+      for j=i+1,MAX_SLOTS-1 do
+        local b = pts[j]
+        if b.active then
+          local dx = ax - b.last_x
+          local dy = ay - b.last_y
+          local d2 = dx*dx + dy*dy
+          if d2 > max2 then max2, pi, pj = d2, i, j end
+        end
       end
-
-      local dx = ax - bx
-      local dy = ay - by
-      local d2_before = dx*dx + dy*dy
-      if d2_before > max_before2 then max_before2 = d2_before end
-
-      local dx2 = ax2 - bx2
-      local dy2 = ay2 - by2
-      local d2_after = dx2*dx2 + dy2*dy2
-      if d2_after > max_after2 then max_after2 = d2_after end
     end
   end
-  return math.sqrt(max_after2) - math.sqrt(max_before2)
+  mon.max2, mon.pi, mon.pj = max2, pi, pj
+  mon.valid = n >= 2 and cnt >= 2
+end
+
+local function mon_move(mon, pts, nact, slot, nx, ny)
+  if not mon.valid then return 0.0 end
+  local before2 = mon.max2
+  if mon.pi ~= slot and mon.pj ~= slot then
+    -- Max pair survives this move: after-max2 = max(before2, best distance
+    -- from the new position to any other committed point).
+    local involve2, argj = 0.0, -1
+    local seen = 0
+    local limit = nact - 1
+    for k=0,MAX_SLOTS-1 do
+      if seen >= limit then break end
+      local p = pts[k]
+      if p.active and k ~= slot then
+        local dx = nx - p.last_x
+        local dy = ny - p.last_y
+        local d2 = dx*dx + dy*dy
+        if d2 > involve2 then involve2, argj = d2, k end
+        seen = seen + 1
+      end
+    end
+    if involve2 > before2 then
+      mon.max2, mon.pi, mon.pj = involve2, slot, argj
+      return math.sqrt(involve2) - math.sqrt(before2)
+    end
+    return 0.0 -- pair unchanged and no longer distance: provably zero
+  end
+  -- Move touches the tracked max pair: exact O(n^2) recompute.
+  local after2, ai, aj = 0.0, -1, -1
+  for i=0,MAX_SLOTS-1 do
+    local a = pts[i]
+    if a.active then
+      local ax, ay = a.last_x, a.last_y
+      if i == slot then ax, ay = nx, ny end
+      for j=i+1,MAX_SLOTS-1 do
+        local b = pts[j]
+        if b.active then
+          local bx, by = b.last_x, b.last_y
+          if j == slot then bx, by = nx, ny end
+          local dx = ax - bx
+          local dy = ay - by
+          local d2 = dx*dx + dy*dy
+          if d2 > after2 then after2, ai, aj = d2, i, j end
+        end
+      end
+    end
+  end
+  mon.max2, mon.pi, mon.pj = after2, ai, aj
+  return math.sqrt(after2) - math.sqrt(before2)
 end
 
 local function out_of_deadzone(gs)
   local all_out = true
-  for slot, sl in pairs(gs.slots) do
-    local mv = sl["x-cum"]*sl["x-cum"] + sl["y-cum"]*sl["y-cum"]
-    dprint("slot", "slot", slot, "mv", tostring(mv))
-    all_out = all_out and (mv > DEADZONE_SQUARED)
+  local sactive, acc = gs.sactive, gs.acc
+  for slot=0,MAX_SLOTS-1 do
+    if sactive[slot] then
+      local sl = acc[slot]
+      local mv = sl.xcum*sl.xcum + sl.ycum*sl.ycum
+      dprint("slot", "slot", slot, "mv", tostring(mv))
+      all_out = all_out and (mv > DEADZONE_SQUARED)
+    end
   end
   return all_out
 end
@@ -496,16 +547,29 @@ end
 local function enqueue(gs, dev_conf, evsec)
   local g = gs.type
   if not g then return end
-  local ok, target = pcall(function()
-    if g.direction == "t" then
-      return dev_conf[g.type][g.fingers][g.direction]
-    elseif g.event == "update" then
-      return dev_conf[g.type][g.fingers][g.direction][g.event][g.update_direction]
-    else
-      return dev_conf[g.type][g.fingers][g.direction][g.event]
+  -- Type-guarded config walk (same semantics as the old pcall'd closure,
+  -- without allocating a closure per gesture event).
+  local node = dev_conf[g.type]
+  if type(node) ~= "table" then node = nil end
+  if node then
+    node = node[g.fingers]
+    if type(node) ~= "table" then node = nil end
+  end
+  local target
+  if node then
+    node = node[g.direction]
+    if type(node) == "table" then
+      if g.direction == "t" then
+        target = node
+      elseif g.event == "update" then
+        local ev_tbl = node[g.event]
+        if type(ev_tbl) == "table" then target = ev_tbl[g.update_direction] end
+      else
+        target = node[g.event]
+      end
     end
-  end)
-  if not ok or not target then
+  end
+  if not target then
     dprint("gesture", "Gesture recognized but not configured.")
     return
   end
@@ -566,54 +630,55 @@ end
 
 local function getRep(gs, dev_conf, default)
   local g = gs.type
-  local ok, rep = pcall(function() return dev_conf[g.type][g.fingers][g.direction]["rep"] end)
-  if ok then
-    if type(rep) == "number" then return rep end
-  end
+  local node = dev_conf[g.type]
+  if type(node) ~= "table" then return default end
+  node = node[g.fingers]
+  if type(node) ~= "table" then return default end
+  node = node[g.direction]
+  if type(node) ~= "table" then return default end
+  local rep = node["rep"]
+  if type(rep) == "number" then return rep end
   return default
 end
 
 -- ================== CLASSIFICATION ==================
-local function classify_after_move(gs, status, dev_conf, evsec)
-  local slots = gs.slots
+local function classify_after_move(gs, dev_conf, evsec)
   local total = gs.total
-  local no_slots = count_keys(slots)
+  local no_slots = gs.nslots
 
   -- Moved?
   -- pinch start
   if (not gs.type) and gs.pinch and total.moved >= 1 and no_slots == 2 then
-    local x_cum = math.abs(total["x-cum"])
-    local y_cum = math.abs(total["y-cum"])
-    local dis_cum = total["dis-cum"]
+    local x_cum = math.abs(total.xcum)
+    local y_cum = math.abs(total.ycum)
+    local dis_cum = total.discum
     dprintf("gesture", "dis_cum=%.0f x_cum+y_cum=%.0f", dis_cum, x_cum + y_cum)
     if x_cum + y_cum > PINCH_DECISION then
       gs.pinch = false
     end
     if math.abs(dis_cum) > PINCH_THRESHOLD and ((not gs.pinch_deadzone_enabled) or out_of_deadzone(gs)) then
-  gs.type = { type="pinch", fingers=tostring(no_slots), event="start", direction = (dis_cum > 0 and 'i' or 'o') }
-  enqueue(gs, dev_conf, evsec)
+      gs.type = { type="pinch", fingers=tostring(no_slots), event="start", direction = (dis_cum > 0 and 'i' or 'o') }
+      enqueue(gs, dev_conf, evsec)
       gs.rep_start = evsec
       -- reset cumulators after triggering start
-      total["x-cum"], total["y-cum"], total["dis-cum"] = 0.0,0.0,0.0
+      total.xcum, total.ycum, total.discum = 0.0,0.0,0.0
       return
     end
   end
 
   -- swipe start
   if (not gs.type) and no_slots >= 3 and total.moved == no_slots then
-    local x_cum = math.abs(total["x-cum"])
-    local y_cum = math.abs(total["y-cum"])
+    local x_cum = math.abs(total.xcum)
+    local y_cum = math.abs(total.ycum)
     if (x_cum*x_cum + y_cum*y_cum) > ((no_slots * DECISION) ^ 2) then
       dprintf("angle", "x_cum=%.0f y_cum=%.0f", x_cum, y_cum)
       local dir
-      local tanX = math.tan(ANGLE_X * math.pi/180)
-      local tanY = math.tan((90-ANGLE_Y) * math.pi/180)
-      if y_cum <= x_cum * tanX then
-        dir = (total["x-cum"] <= 0) and "l" or "r"
-      elseif y_cum >= x_cum * tanY then
-        dir = (total["y-cum"] <= 0) and "u" or "d"
+      if y_cum <= x_cum * TANX then
+        dir = (total.xcum <= 0) and "l" or "r"
+      elseif y_cum >= x_cum * TANY then
+        dir = (total.ycum <= 0) and "u" or "d"
       else
-        local x = total["x-cum"]; local y = total["y-cum"]
+        local x = total.xcum; local y = total.ycum
         if x*y > 0 then
           dir = (x <=0 and y <0) and "lu" or "rd"
         else
@@ -621,51 +686,51 @@ local function classify_after_move(gs, status, dev_conf, evsec)
         end
       end
       gs.type = { type="swipe", fingers=tostring(no_slots), event="start", direction=dir }
-  enqueue(gs, dev_conf, evsec)
+      enqueue(gs, dev_conf, evsec)
       gs.rep_start = evsec
-      gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"] = 0.0,0.0,0.0
+      total.xcum, total.ycum, total.discum = 0.0,0.0,0.0
     end
   end
 
   -- updates (repeat)
   if gs.type then
     if (evsec - gs.rep_start) < REP_THRES then
-      total["x-cum"], total["y-cum"], total["dis-cum"] = 0.0,0.0,0.0
+      total.xcum, total.ycum, total.discum = 0.0,0.0,0.0
       return
     end
     gs.type.event = "update"
     if gs.type.type == "pinch" then
       local rep = getRep(gs, dev_conf, PINCH_REP_DEF)
-      if math.abs(total["dis-cum"]) > rep then
-  gs.type.update_direction = (total["dis-cum"] > 0) and 'i' or 'o'
-  enqueue(gs, dev_conf, evsec)
-        total["dis-cum"] = 0
+      if math.abs(total.discum) > rep then
+        gs.type.update_direction = (total.discum > 0) and 'i' or 'o'
+        enqueue(gs, dev_conf, evsec)
+        total.discum = 0
       end
     else
       -- swipe
       local dir = gs.type.direction
       if dir == 'l' or dir == 'r' or dir == 'u' or dir == 'd' then
         local rep = getRep(gs, dev_conf, REP_DEF)
-        if total["x-cum"] >= rep then
-          gs.type.update_direction = 'r'; enqueue(gs, dev_conf, evsec); total["x-cum"] = 0
-        elseif total["x-cum"] <= -rep then
-          gs.type.update_direction = 'l'; enqueue(gs, dev_conf, evsec); total["x-cum"] = 0
-        elseif total["y-cum"] >= rep then
-          gs.type.update_direction = 'd'; enqueue(gs, dev_conf, evsec); total["y-cum"] = 0
-        elseif total["y-cum"] <= -rep then
-          gs.type.update_direction = 'u'; enqueue(gs, dev_conf, evsec); total["y-cum"] = 0
+        if total.xcum >= rep then
+          gs.type.update_direction = 'r'; enqueue(gs, dev_conf, evsec); total.xcum = 0
+        elseif total.xcum <= -rep then
+          gs.type.update_direction = 'l'; enqueue(gs, dev_conf, evsec); total.xcum = 0
+        elseif total.ycum >= rep then
+          gs.type.update_direction = 'd'; enqueue(gs, dev_conf, evsec); total.ycum = 0
+        elseif total.ycum <= -rep then
+          gs.type.update_direction = 'u'; enqueue(gs, dev_conf, evsec); total.ycum = 0
         end
       else
         -- diagonals: lu, rd, ld, ru
         local rep = getRep(gs, dev_conf, REP_DAG_DEF)
-        if (total["x-cum"] + total["y-cum"]) >= rep then
-          gs.type.update_direction = 'rd'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
-        elseif (total["x-cum"] + total["y-cum"]) <= -rep then
-          gs.type.update_direction = 'lu'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
-        elseif (total["x-cum"] - total["y-cum"]) >= rep then
-          gs.type.update_direction = 'ru'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
-        elseif (total["x-cum"] - total["y-cum"]) <= -rep then
-          gs.type.update_direction = 'ld'; enqueue(gs, dev_conf, evsec); total["x-cum"], total["y-cum"] = 0,0
+        if (total.xcum + total.ycum) >= rep then
+          gs.type.update_direction = 'rd'; enqueue(gs, dev_conf, evsec); total.xcum, total.ycum = 0,0
+        elseif (total.xcum + total.ycum) <= -rep then
+          gs.type.update_direction = 'lu'; enqueue(gs, dev_conf, evsec); total.xcum, total.ycum = 0,0
+        elseif (total.xcum - total.ycum) >= rep then
+          gs.type.update_direction = 'ru'; enqueue(gs, dev_conf, evsec); total.xcum, total.ycum = 0,0
+        elseif (total.xcum - total.ycum) <= -rep then
+          gs.type.update_direction = 'ld'; enqueue(gs, dev_conf, evsec); total.xcum, total.ycum = 0,0
         end
       end
     end
@@ -702,78 +767,110 @@ local function create_device(devpath, calibration, device_key)
   dprint("gesture", "orientation:", orientation, "swap:", tostring(swap_x_y), "ox:", tostring(orientation_x), "oy:", tostring(orientation_y))
 
   local ev_size = ffi.sizeof("struct input_event")
-  local ev = ffi.new("struct input_event")
-  local status = {}  -- slot -> {x,y,x_updated,y_updated,first}
+  local pts = ffi.new("wenk_point_t[?]", MAX_SLOTS) -- slot -> staged/committed coords
+  local n_status = 0   -- maintained incrementally
+  local mon = mon_new()
   local current_slot = 0
   local gs = newGestureState(pinch_deadzone_enabled)
   gs.debounce = 0
   local has_mt_slot = false -- detect if device emits ABS_MT_SLOT; else fallback to synthetic slot 0
   local typeA = { mode=false, current_tid=nil, tid_to_slot={}, slot_to_tid={}, next_slot=0 }
+  local warned_overflow = false
 
   local function ensure_slot_exists(slot)
+    local st = pts[slot]
     local new_created = false
-    if not status[slot] then
-      status[slot] = { x=0, y=0, last_x=0, last_y=0, x_updated=false, y_updated=false, first=true }
+    if not st.active then
+      st.x, st.y = 0.0, 0.0
+      st.last_x, st.last_y = 0.0, 0.0
+      st.x_updated, st.y_updated = false, false
+      st.first = true
+      st.active = true
+      n_status = n_status + 1
       new_created = true
+      -- point set changed: the tracked max pair may be stale
+      mon_rebuild(mon, pts, n_status)
     end
-    if not gs.slots[slot] then
-      gs.slots[slot] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 }
+    if not gs.sactive[slot] then
+      gs.sactive[slot] = true
+      gs.nslots = gs.nslots + 1
     end
-    if new_created then
-      if (gs.max_fingers or 0) < (count_keys(status)) then
-        gs.max_fingers = count_keys(status)
-      end
+    if new_created and gs.max_fingers < n_status then
+      gs.max_fingers = n_status
+    end
+  end
+
+  local function remove_point(slot)
+    -- Drop a finger from both the coordinate set and the gesture session.
+    local st = pts[slot]
+    if st.active then
+      st.active = false
+      st.x_updated, st.y_updated = false, false
+      n_status = n_status - 1
+      mon_rebuild(mon, pts, n_status)
+    end
+    if gs.sactive[slot] then
+      gs.sactive[slot] = false
+      gs.nslots = gs.nslots - 1
     end
   end
 
   local function finger_start(evsec, slot)
-    -- Match Python semantics: every new finger start resets accumulators, preserving existing slot keys
+    -- Match Python semantics: every new finger start resets accumulators,
+    -- preserving the slot membership set (memset-speed reset).
     gs.last_command_is_gesture_end = false
     gs.debounce = evsec
     gs.type = nil
-    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0.0,0.0,0.0,0
-    local prev_slots = gs.slots
-    gs.slots = {}
-    for k,_ in pairs(prev_slots) do
-      gs.slots[k] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 }
+    ffi.fill(gs.acc, ffi.sizeof("wenk_acc_t") * MAX_SLOTS, 0)
+    local ttl = gs.total
+    ttl.xcum, ttl.ycum, ttl.discum, ttl.moved = 0.0,0.0,0.0,0
+    if not gs.sactive[slot] then
+      gs.sactive[slot] = true
+      gs.nslots = gs.nslots + 1
     end
-    if not gs.slots[slot] then
-      gs.slots[slot] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 }
-    end
-    -- Initialize last processed coordinates to current sample
-    local s = status[slot]
-    if s then s.last_x, s.last_y = s.x, s.y end
+    -- Initialize last processed coordinates to current sample. This mutates
+    -- committed geometry, so the max-distance monitor must be rebuilt.
+    local s = pts[slot]
+    s.last_x, s.last_y = s.x, s.y
+    mon_rebuild(mon, pts, n_status)
   end
 
   local function process_update(slot, nx, ny, evsec)
-    -- prepare slot entry
-    if not gs.slots[slot] then gs.slots[slot] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 } end
-    local prev = status[slot]
-    local dx = nx - (prev.last_x or prev.x)
-    local dy = ny - (prev.last_y or prev.y)
-    local sl = gs.slots[slot]
-    sl["x-cum"] = sl["x-cum"] + dx
-    sl["y-cum"] = sl["y-cum"] + dy
-    gs.total["x-cum"] = gs.total["x-cum"] + dx
-    gs.total["y-cum"] = gs.total["y-cum"] + dy
+    local sl = gs.acc[slot]
+    local prev = pts[slot]
+    local dx = nx - prev.last_x
+    local dy = ny - prev.last_y
+    sl.xcum = sl.xcum + dx
+    sl.ycum = sl.ycum + dy
+    local ttl = gs.total
+    ttl.xcum = ttl.xcum + dx
+    ttl.ycum = ttl.ycum + dy
 
-    local distance_delta = max_distance_delta(status, slot, nx, ny)
-    prev.x = nx; prev.y = ny
-    prev.last_x = nx; prev.last_y = ny
-    gs.total["dis-cum"] = gs.total["dis-cum"] + distance_delta
+    -- Delta is measured against last-processed coords (prev.last_*), NOT the
+    -- staged prev.x/.y (the EV_ABS handler overwrites those before we are
+    -- called). The monitor tracks committed coords and is updated in-place;
+    -- if this slot did not move, the committed geometry is unchanged and the
+    -- delta is provably zero (skip the scan entirely).
+    local distance_delta = 0.0
+    if dx ~= 0 or dy ~= 0 then
+      distance_delta = mon_move(mon, pts, n_status, slot, nx, ny)
+    end
+    prev.last_x = nx
+    prev.last_y = ny
+    ttl.discum = ttl.discum + distance_delta
 
     if sl.moved == 0 then
-      if (sl["x-cum"]*sl["x-cum"] + sl["y-cum"]*sl["y-cum"]) > THRESHOLD_SQUARED then
+      if (sl.xcum*sl.xcum + sl.ycum*sl.ycum) > THRESHOLD_SQUARED then
         sl.moved = 1
-        gs.total.moved = gs.total.moved + 1
+        ttl.moved = ttl.moved + 1
       end
     end
-    dprintf("gesture", "total x=%.0f y=%.0f dis=%.0f moved=%d", gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved)
-    classify_after_move(gs, status, dev_conf, evsec)
+    dprintf("gesture", "total x=%.0f y=%.0f dis=%.0f moved=%d", ttl.xcum, ttl.ycum, ttl.discum, ttl.moved)
+    classify_after_move(gs, dev_conf, evsec)
   end
 
   local function gesture_end(evsec)
-    local no_slots = count_keys(gs.slots)
+    local no_slots = gs.nslots
     dprint("gesture", "gesture_end slots="..tostring(no_slots))
     if (evsec - gs.debounce) >= DEBOUNCE then
       if gs.type then
@@ -781,7 +878,7 @@ local function create_device(devpath, calibration, device_key)
         enqueue(gs, dev_conf, evsec)
       else
         -- Tap fallback based on max fingers during gesture session
-        local fingers = gs.max_fingers or no_slots
+        local fingers = gs.max_fingers
         if fingers >= 3 then
           gs.type = { type="swipe", fingers=tostring(fingers), direction="t" }
           enqueue(gs, dev_conf, evsec)
@@ -789,20 +886,18 @@ local function create_device(devpath, calibration, device_key)
       end
     end
     -- Exec queue now; async if 5 fingers
-    local fingers_async = gs.max_fingers or no_slots
-    exec_queue(gs, fingers_async == 5)
+    exec_queue(gs, gs.max_fingers == 5)
 
-    -- reset params
+    -- reset params (membership preserved; memset-speed accumulator reset)
     gs.gesture_queue = {}
     gs.pinch = true
     gs.debounce = evsec
     gs.started = false
     gs.max_fingers = 0
-    local old_slots = gs.slots
     gs.type = nil
-    gs.total["x-cum"], gs.total["y-cum"], gs.total["dis-cum"], gs.total.moved = 0.0,0.0,0.0,0
-    gs.slots = {}
-    for k,_ in pairs(old_slots) do gs.slots[k] = { ["x-cum"]=0.0, ["y-cum"]=0.0, moved=0 } end
+    ffi.fill(gs.acc, ffi.sizeof("wenk_acc_t") * MAX_SLOTS, 0)
+    local ttl = gs.total
+    ttl.xcum, ttl.ycum, ttl.discum, ttl.moved = 0.0,0.0,0.0,0
   end
 
   local function flush_if_debounced(nowsec)
@@ -812,20 +907,25 @@ local function create_device(devpath, calibration, device_key)
   end
 
   local function allocate_slot()
-    -- Find the lowest free non-negative slot index
-    local used = {}
-    -- consider both current gesture slots and status slots to avoid collisions
-    for s,_ in pairs(gs.slots) do used[s] = true end
-    for s,_ in pairs(status) do used[s] = true end
-    local i = 0
-    while used[i] do i = i + 1 end
-    return i
+    -- Find the lowest free non-negative slot index; consider both coordinate
+    -- points and session membership to avoid collisions.
+    for i=0,MAX_SLOTS-1 do
+      if not (pts[i].active or gs.sactive[i]) then return i end
+    end
+    return nil
   end
 
   local function ensure_typeA_slot_for_tid(tid)
     local slot = typeA.tid_to_slot[tid]
     if slot == nil then
       slot = allocate_slot()
+      if slot == nil then
+        if not warned_overflow then
+          warned_overflow = true
+          io.stderr:write("Type A contact overflow (>"..MAX_SLOTS.." slots); ignoring extra contacts\n")
+        end
+        return nil
+      end
       typeA.tid_to_slot[tid] = slot
       typeA.slot_to_tid[slot] = tid
     end
@@ -834,22 +934,26 @@ local function create_device(devpath, calibration, device_key)
 
   local function end_typeA_tid(tid, evsec)
     local slot = typeA.tid_to_slot[tid]
-    if slot ~= nil then
+    if slot ~= nil and slot < MAX_SLOTS then
       -- finalize any pending first/update before removal
-      local s = status[slot]
-      if s and (s.x_updated or s.y_updated) then
+      local s = pts[slot]
+      if s.active and (s.x_updated or s.y_updated) then
         if s.first then s.first = false; finger_start(evsec, slot) else process_update(slot, s.x, s.y, evsec) end
       end
-      status[slot] = nil
-      gs.slots[slot] = nil
+      remove_point(slot)
+      typeA.slot_to_tid[slot] = nil
+      typeA.tid_to_slot[tid] = nil
+    elseif slot == nil then
+      typeA.tid_to_slot[tid] = nil
+    else
       typeA.slot_to_tid[slot] = nil
       typeA.tid_to_slot[tid] = nil
     end
   end
 
   local function finalize_slot(slot, evsec)
-    local s = status[slot]
-    if not s then return end
+    local s = pts[slot]
+    if not s.active then return end
     if s.first then
       s.first = false
       finger_start(evsec, slot)
@@ -862,6 +966,179 @@ local function create_device(devpath, calibration, device_key)
   local dead = false   -- set by read_available on EOF/fatal error
   local closed = false
 
+  -- Batched input: one read() drains up to EVBUF_N events instead of paying a
+  -- syscall per event. A partial trailing event (defensive only; evdev returns
+  -- whole events when the buffer fits at least one) is moved to the buffer
+  -- front and completed by the next read.
+  local EVBUF_N = 64
+  local evbuf = ffi.new("struct input_event[?]", EVBUF_N)
+  local buf_bytes = ev_size * EVBUF_N
+  local buf_base = ffi.cast("char*", evbuf)
+
+  local function handle_event(e)
+    local evsec = ev_time_seconds(e)
+
+    if e.type == EV_SYN then
+      if e.code == SYN_MT_REPORT then
+        -- Type A devices: per-contact separator
+        if typeA.mode and typeA.current_tid ~= nil then
+          local slot = typeA.tid_to_slot[typeA.current_tid]
+          if slot ~= nil and slot < MAX_SLOTS then
+            -- finalize pending updates for this contact even if only one axis changed
+            local s = pts[slot]
+            if s.active and (s.x_updated or s.y_updated) then
+              finalize_slot(slot, evsec)
+            end
+          end
+          -- clear current finger context
+          typeA.current_tid = nil
+        end
+      elseif e.code == SYN_REPORT then
+        -- End of frame: finalize any pending partial updates (scan active
+        -- points; early-exit once every tracked point was visited)
+        if n_status > 0 then
+          local seen = 0
+          for slot=0,MAX_SLOTS-1 do
+            local s = pts[slot]
+            if s.active then
+              seen = seen + 1
+              if s.x_updated or s.y_updated then
+                finalize_slot(slot, evsec)
+              end
+              if seen >= n_status then break end
+            end
+          end
+        end
+        flush_if_debounced(evsec)
+      else
+        -- Other SYN codes: still consider flushing debounced queue
+        flush_if_debounced(evsec)
+      end
+    elseif e.type == EV_ABS then
+      local code = e.code
+      local val = e.value
+      dprint_raw(e.type, code, val)
+      if code == ABS_MT_SLOT then
+        if val < MAX_SLOTS then
+          current_slot = val
+          ensure_slot_exists(current_slot)
+          has_mt_slot = true
+        elseif not warned_overflow then
+          warned_overflow = true
+          io.stderr:write("MT slot id "..val.." exceeds "..MAX_SLOTS.." slots; ignoring\n")
+        end
+      elseif code == ABS_MT_TRACKING_ID then
+        local is_minus_one = (val == 0xFFFFFFFF) or (bit.tobit(val) == -1)
+        if is_minus_one then
+          -- finger removed
+          if not gs.last_command_is_gesture_end then
+            gs.last_command_is_gesture_end = true
+            gesture_end(evsec)
+          end
+          if has_mt_slot then
+            remove_point(current_slot)
+          else
+            typeA.mode = true
+            if typeA.current_tid ~= nil then
+              end_typeA_tid(typeA.current_tid, evsec)
+              typeA.current_tid = nil
+            end
+          end
+        else
+          if has_mt_slot then
+            ensure_slot_exists(current_slot)
+            local s = pts[current_slot]
+            s.first = true
+            s.x_updated = false
+            s.y_updated = false
+          else
+            typeA.mode = true
+            typeA.current_tid = val
+            local slot = ensure_typeA_slot_for_tid(val)
+            if slot ~= nil then
+              current_slot = slot
+              ensure_slot_exists(current_slot)
+              local s = pts[current_slot]
+              s.first = true
+              s.x_updated = false
+              s.y_updated = false
+            end
+          end
+        end
+      elseif code == ABS_MT_POSITION_X then
+        if not has_mt_slot then
+          typeA.mode = true
+          if typeA.current_tid ~= nil then
+            local slot = ensure_typeA_slot_for_tid(typeA.current_tid)
+            if slot ~= nil then current_slot = slot end
+          else
+            -- if no current TID yet, use synthetic slot 0 for now
+            current_slot = 0
+          end
+        end
+        if not pts[current_slot].active then ensure_slot_exists(current_slot) end
+        local s = pts[current_slot]
+        if swap_x_y then
+          s.y = val * scale_y
+          s.y_updated = true
+        else
+          s.x = val * scale_x
+          s.x_updated = true
+        end
+      elseif code == ABS_MT_POSITION_Y then
+        if not has_mt_slot then
+          typeA.mode = true
+          if typeA.current_tid ~= nil then
+            local slot = ensure_typeA_slot_for_tid(typeA.current_tid)
+            if slot ~= nil then current_slot = slot end
+          else
+            current_slot = 0
+          end
+        end
+        if not pts[current_slot].active then ensure_slot_exists(current_slot) end
+        local s = pts[current_slot]
+        if swap_x_y then
+          s.x = val * scale_x
+          s.x_updated = true
+        else
+          s.y = val * scale_y
+          s.y_updated = true
+        end
+      elseif code == ABS_X or code == ABS_Y then
+        -- Single-touch fallback mapped to slot 0, only if device lacks MT slots
+        if not has_mt_slot then
+          current_slot = 0
+          ensure_slot_exists(current_slot)
+          local s = pts[current_slot]
+          if code == ABS_X then
+            if swap_x_y then
+              s.y = val * scale_y; s.y_updated = true
+            else
+              s.x = val * scale_x; s.x_updated = true
+            end
+          else -- ABS_Y
+            if swap_x_y then
+              s.x = val * scale_x; s.x_updated = true
+            else
+              s.y = val * scale_y; s.y_updated = true
+            end
+          end
+        end
+      end
+
+      local s = pts[current_slot]
+      if s.active and s.x_updated and s.y_updated then
+        if s.first then
+          s.first = false
+          finger_start(evsec, current_slot)
+        else
+          process_update(current_slot, s.x, s.y, evsec)
+        end
+        s.x_updated, s.y_updated = false, false
+      end
+    end
+  end
+
   local dev = {
     fd = fd,
     path = devpath,
@@ -869,166 +1146,32 @@ local function create_device(devpath, calibration, device_key)
     calibration = calibration,
     is_dead = function() return dead end,
     read_available = function()
+      local fill = 0 -- valid bytes at buffer front (a carried partial event)
       while true do
-        local r = ffi.C.read(fd, ev, ev_size)
-        if r == ev_size then
-          -- full event read, continue processing
-        elseif r < 0 then
+        local r = tonumber(ffi.C.read(fd, buf_base + fill, buf_bytes - fill))
+        if r < 0 then
           local err = ffi.errno()
           if err == EINTR then
-            -- interrupted syscall; retry
+            -- interrupted syscall; retry with unchanged fill
           elseif err == EAGAIN then
             break -- drained; normal for O_NONBLOCK
           else
             dead = true -- fatal (ENODEV etc.): signal removal
             break
           end
-        else
-          dead = true -- r == 0: device gone
+        elseif r == 0 then
+          dead = true -- EOF: device gone
           break
-        end
-
-        local evsec = ev_time_seconds(ev)
-
-        if ev.type == EV_SYN then
-          if ev.code == SYN_MT_REPORT then
-            -- Type A devices: per-contact separator
-            if typeA.mode and typeA.current_tid ~= nil then
-              local slot = typeA.tid_to_slot[typeA.current_tid]
-              if slot ~= nil then
-                -- finalize pending updates for this contact even if only one axis changed
-                local s = status[slot]
-                if s and (s.x_updated or s.y_updated) then
-                  finalize_slot(slot, evsec)
-                end
-              end
-              -- clear current finger context
-              typeA.current_tid = nil
-            end
-          elseif ev.code == SYN_REPORT then
-            -- End of frame: finalize any pending partial updates
-            for slot,_ in pairs(status) do
-              local s = status[slot]
-              if s and (s.x_updated or s.y_updated) then
-                finalize_slot(slot, evsec)
-              end
-            end
-            flush_if_debounced(evsec)
-          else
-            -- Other SYN codes: still consider flushing debounced queue
-            flush_if_debounced(evsec)
+        else
+          local total = fill + r
+          local n = total - (total % ev_size)
+          local nev = math.floor(total / ev_size)
+          for k = 0, nev - 1 do
+            handle_event(evbuf[k])
           end
-        elseif ev.type == EV_ABS then
-          local code = ev.code
-          local val = ev.value
-          dprint_raw(ev.type, code, val)
-          if code == ABS_MT_SLOT then
-            current_slot = val
-            ensure_slot_exists(current_slot)
-            has_mt_slot = true
-          elseif code == ABS_MT_TRACKING_ID then
-            local is_minus_one = (val == 0xFFFFFFFF) or (bit.tobit(val) == -1)
-            if is_minus_one then
-              -- finger removed
-              if not gs.last_command_is_gesture_end then
-                gs.last_command_is_gesture_end = true
-                gesture_end(evsec)
-              end
-              if has_mt_slot then
-                status[current_slot] = nil
-                gs.slots[current_slot] = nil
-              else
-                typeA.mode = true
-                if typeA.current_tid ~= nil then
-                  end_typeA_tid(typeA.current_tid, evsec)
-                  typeA.current_tid = nil
-                end
-              end
-            else
-              if has_mt_slot then
-                ensure_slot_exists(current_slot)
-                status[current_slot].first = true
-                status[current_slot].x_updated = false
-                status[current_slot].y_updated = false
-              else
-                typeA.mode = true
-                typeA.current_tid = val
-                local slot = ensure_typeA_slot_for_tid(val)
-                current_slot = slot
-                ensure_slot_exists(current_slot)
-                status[current_slot].first = true
-                status[current_slot].x_updated = false
-                status[current_slot].y_updated = false
-              end
-            end
-          elseif code == ABS_MT_POSITION_X then
-            if not has_mt_slot then
-              typeA.mode = true
-              if typeA.current_tid ~= nil then
-                current_slot = ensure_typeA_slot_for_tid(typeA.current_tid)
-              else
-                -- if no current TID yet, use synthetic slot 0 for now
-                current_slot = 0
-              end
-            end
-            if not status[current_slot] then ensure_slot_exists(current_slot) end
-            local s = status[current_slot]
-            if swap_x_y then
-              s.y = val * scale_y
-              s.y_updated = true
-            else
-              s.x = val * scale_x
-              s.x_updated = true
-            end
-          elseif code == ABS_MT_POSITION_Y then
-            if not has_mt_slot then
-              typeA.mode = true
-              if typeA.current_tid ~= nil then
-                current_slot = ensure_typeA_slot_for_tid(typeA.current_tid)
-              else
-                current_slot = 0
-              end
-            end
-            if not status[current_slot] then ensure_slot_exists(current_slot) end
-            local s = status[current_slot]
-            if swap_x_y then
-              s.x = val * scale_x
-              s.x_updated = true
-            else
-              s.y = val * scale_y
-              s.y_updated = true
-            end
-          elseif code == ABS_X or code == ABS_Y then
-            -- Single-touch fallback mapped to slot 0, only if device lacks MT slots
-            if not has_mt_slot then
-              current_slot = 0
-              ensure_slot_exists(current_slot)
-              local s = status[current_slot]
-              if code == ABS_X then
-                if swap_x_y then
-                  s.y = val * scale_y; s.y_updated = true
-                else
-                  s.x = val * scale_x; s.x_updated = true
-                end
-              else -- ABS_Y
-                if swap_x_y then
-                  s.x = val * scale_x; s.x_updated = true
-                else
-                  s.y = val * scale_y; s.y_updated = true
-                end
-              end
-            end
-          end
-
-          local s = status[current_slot]
-          if s and s.x_updated and s.y_updated then
-            if s.first then
-              s.first = false
-              finger_start(evsec, current_slot)
-            else
-              process_update(current_slot, s.x, s.y, evsec)
-            end
-            s.x_updated, s.y_updated = false, false
+          fill = total - n
+          if fill > 0 then
+            ffi.copy(buf_base, buf_base + n, fill)
           end
         end
       end
@@ -1079,31 +1222,61 @@ local function parse_args(argv)
       TYPE_FILTER[#TYPE_FILTER+1] = a
     end
   end
+  -- Freeze debug helpers after option parsing: with logging disabled, rebind
+  -- to no-ops so hot-path call sites never run the filter loop, vararg
+  -- packing or string formatting.
+  if not DEBUG then
+    dprint = function() end
+    dprintf = function() end
+    dprint_raw = function() end
+  end
 end
 
 local function run_benchmark()
-  local function mk_status()
-    return {
-      [0] = {x=10, y=10},
-      [1] = {x=200, y=50},
-      [2] = {x=450, y=600},
-      [3] = {x=800, y=300},
-      [4] = {x=1000, y=900},
-    }
+  -- Self-contained: legacy full scans (as they existed pre-optimization) vs
+  -- the incremental FFI monitor used by process_update. Both compute the
+  -- identical delta sequence, so their sums double as a correctness check.
+  local function legacy_max(status)
+    local max2 = 0.0
+    for i, a in pairs(status) do
+      for j, b in pairs(status) do
+        if i < j then
+          local dx, dy = a.x - b.x, a.y - b.y
+          local d2 = dx*dx + dy*dy
+          if d2 > max2 then max2 = d2 end
+        end
+      end
+    end
+    return math.sqrt(max2)
   end
 
   local iters = BENCH_ITERS
-  local status_old = mk_status()
-  local status_new = mk_status()
+  local status_old = {
+    [0] = {x=10, y=10},
+    [1] = {x=200, y=50},
+    [2] = {x=450, y=600},
+    [3] = {x=800, y=300},
+    [4] = {x=1000, y=900},
+  }
+  local pts = ffi.new("wenk_point_t[?]", MAX_SLOTS)
+  local init = { {10,10}, {200,50}, {450,600}, {800,300}, {1000,900} }
+  for k=0,4 do
+    local p = pts[k]
+    p.active = true
+    p.x, p.y = init[k+1][1], init[k+1][2]
+    p.last_x, p.last_y = p.x, p.y
+  end
+  local mon = mon_new()
+  mon_rebuild(mon, pts, 5)
   local sum_old, sum_new = 0, 0
 
   local t0 = os.clock()
   for i=1,iters do
     local nx = (i * 17) % 1024
     local ny = (i * 31) % 1024
-    local before = max_distance(status_old)
+    local before = legacy_max(status_old)
     status_old[1].x, status_old[1].y = nx, ny
-    local after = max_distance(status_old)
+    local after = legacy_max(status_old)
     sum_old = sum_old + (after - before)
   end
   local old_secs = os.clock() - t0
@@ -1112,8 +1285,9 @@ local function run_benchmark()
   for i=1,iters do
     local nx = (i * 17) % 1024
     local ny = (i * 31) % 1024
-    local delta = max_distance_delta(status_new, 1, nx, ny)
-    status_new[1].x, status_new[1].y = nx, ny
+    local s1 = pts[1]
+    local delta = mon_move(mon, pts, 5, 1, nx, ny)
+    s1.last_x, s1.last_y = nx, ny
     sum_new = sum_new + delta
   end
   local new_secs = os.clock() - t1
@@ -1123,9 +1297,10 @@ local function run_benchmark()
   local speedup = (new_secs > 0) and (old_secs / new_secs) or 0
 
   io.stderr:write(string.format("Benchmark iterations: %d\n", iters))
-  io.stderr:write(string.format("max_distance x2: %.6fs (%.0f ops/s) sum=%.3f\n", old_secs, old_ops, sum_old))
-  io.stderr:write(string.format("max_distance_delta: %.6fs (%.0f ops/s) sum=%.3f\n", new_secs, new_ops, sum_new))
-  io.stderr:write(string.format("speedup: %.2fx\n", speedup))
+  io.stderr:write(string.format("legacy scan x2: %.6fs (%.0f ops/s) sum=%.3f\n", old_secs, old_ops, sum_old))
+  io.stderr:write(string.format("monitor delta: %.6fs (%.0f ops/s) sum=%.3f\n", new_secs, new_ops, sum_new))
+  io.stderr:write(string.format("speedup: %.2fx (sums %s)\n", speedup,
+    math.abs(sum_old - sum_new) < 1e-3 and "match" or string.format("MISMATCH %.3f vs %.3f", sum_old, sum_new)))
 end
 
 local function main(argv)
@@ -1140,10 +1315,10 @@ local function main(argv)
   local processor_count = 0
   local pollfds = ffi.new("struct pollfd[?]", MAX_DEVICES)
 
-  local function resume_or_report(co, ...)
-    local ok, err = coroutine.resume(co, ...)
+  local function safe_call(fn, ...)
+    local ok, err = pcall(fn, ...)
     if not ok then
-      io.stderr:write("Processor coroutine failed: "..tostring(err).."\n")
+      io.stderr:write("Processor failed: "..tostring(err).."\n")
       RUNNING = false
       return false
     end
@@ -1152,7 +1327,7 @@ local function main(argv)
 
   local function find_processor_by_path(path)
     for i=1,processor_count do
-      if processors[i].dev.path == path then return i end
+      if processors[i].path == path then return i end
     end
     return nil
   end
@@ -1172,30 +1347,19 @@ local function main(argv)
       return false
     end
     open_failed[info.path] = nil
-    -- build coroutine that reacts to 'readable'/'shutdown' signals
-    local co = coroutine.create(function()
-      while RUNNING do
-        local sig = coroutine.yield()
-        if sig == 'shutdown' then break end
-        if sig == 'readable' then dev.read_available() end
-      end
-      dev.close()
-    end)
     processor_count = processor_count + 1
-    processors[processor_count] = { dev = dev, co = co }
+    processors[processor_count] = dev
     pollfds[processor_count-1].fd = dev.fd
     pollfds[processor_count-1].events = POLLIN
     pollfds[processor_count-1].revents = 0
     io.stderr:write(string.format("Using %s (%s)\n", info.path, info.kind))
-    resume_or_report(co) -- prime
     return true
   end
 
   local function remove_processor(i)
-    local p = processors[i]
-    io.stderr:write("Device lost: "..p.dev.path.."\n")
-    resume_or_report(p.co, 'shutdown')
-    p.dev.close()
+    local dev = processors[i]
+    io.stderr:write("Device lost: "..dev.path.."\n")
+    dev.close()
     -- swap-with-last compaction; order is irrelevant for poll()
     local last = processor_count
     if i ~= last then
@@ -1249,12 +1413,12 @@ local function main(argv)
       local i = 1
       while i <= processor_count do
         local rev = pollfds[i-1].revents
-        if bit.band(rev, bit.bor(POLLERR, POLLHUP, POLLNVAL)) ~= 0 or processors[i].dev.is_dead() then
+        if bit.band(rev, bit.bor(POLLERR, POLLHUP, POLLNVAL)) ~= 0 or processors[i].is_dead() then
           remove_processor(i)
           need_rescan = true
           -- index stays put so a swapped-in entry gets inspected too
         elseif bit.band(rev, POLLIN) ~= 0 then
-          if not resume_or_report(processors[i].co, 'readable') then break end
+          if not safe_call(processors[i].read_available) then break end
           i = i + 1
         else
           i = i + 1
@@ -1267,9 +1431,9 @@ local function main(argv)
   end
   -- shutdown
   for i=1,processor_count do
-    local p = processors[i]
-    resume_or_report(p.co, 'shutdown')
-    p.dev.close()
+    local dev = processors[i]
+    dev.close()
+    processors[i] = nil
   end
 end
 
